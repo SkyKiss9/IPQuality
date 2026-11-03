@@ -407,6 +407,13 @@ namespace IpQuality
             return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
         }
 
+        // 纵轴刻度统一按刻度步长决定小数位，避免出现“15 / 10 / 5.0”这种混排
+        static string Axis(double v, double step)
+        {
+            int digits = step >= 1 ? 0 : (int)Math.Ceiling(-Math.Log10(step) - 1e-9);
+            return v.ToString("F" + digits);
+        }
+
         public static string Ms(double v) { return v < 10 ? v.ToString("0.0") : v < 1000 ? v.ToString("0") : v.ToString("#,0"); }
 
         protected override void OnRender(DrawingContext dc)
@@ -427,7 +434,7 @@ namespace IpQuality
             if (maxMs <= 0) maxMs = 10;
             double step = Nice(maxMs * 1.15 / 4), yMax = Math.Ceiling(maxMs * 1.15 / step) * step;
 
-            double labelW = Txt(Ms(yMax), 11, muted, false).Width;
+            double labelW = Txt(Axis(yMax, step), 11, muted, false).Width;
             double left = Math.Ceiling(labelW) + 10, right = W - 6, top = 8, bottom = H - 22;
             if (bottom - top < 20 || right - left < 20) return;
             Func<double, double> Y = v => bottom - v / yMax * (bottom - top);
@@ -438,7 +445,7 @@ namespace IpQuality
             {
                 double y = Math.Round(Y(v)) + 0.5;
                 dc.DrawLine(grid, new Point(left, y), new Point(right, y));
-                var t = Txt(Ms(v), 11, muted, false);
+                var t = Txt(Axis(v, step), 11, muted, false);
                 dc.DrawText(t, new Point(left - 8 - t.Width, y - t.Height / 2));
             }
             var z = Txt("0", 11, muted, false);
@@ -530,7 +537,7 @@ namespace IpQuality
                 for (int i = start; i < total; i++) if (Data[i].Ok) maxMs = Math.Max(maxMs, Data[i].Ms);
                 if (maxMs <= 0) maxMs = 10;
                 double step = Nice(maxMs * 1.15 / 4), yMax = Math.Ceiling(maxMs * 1.15 / step) * step;
-                left = Math.Ceiling(Txt(Ms(yMax), 11, muted, false).Width) + 10;
+                left = Math.Ceiling(Txt(Axis(yMax, step), 11, muted, false).Width) + 10;
                 double xs = (right - left) / slots;
                 int i2 = (int)Math.Floor((e.GetPosition(this).X - left) / xs);
                 if (i2 >= 0 && i2 < shown) h = i2;
@@ -758,7 +765,7 @@ namespace IpQuality
         ManualResetEvent stopEvt;
         bool running;
         Settings cur;
-        string pathText = "";
+        string pathText = "", portHint;
         int sent, recv, jitN;
         double sum, min, max, jitSum, lastOk = -1;
 
@@ -767,7 +774,7 @@ namespace IpQuality
         public MainWindow()
         {
             th = Theme.Detect();
-            Title = "IP 质量测试";
+            Title = "IP 质量测试 1.0.1";
             Width = 960; Height = 860; MinWidth = 800; MinHeight = 720;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             UseLayoutRounding = true;
@@ -896,6 +903,7 @@ namespace IpQuality
             else { if (!ReadInt(tSize, "包大小", 0, 65500, out v)) return; s.Size = v; }
 
             cur = s;
+            portHint = null;
             sent = recv = jitN = 0; sum = jitSum = 0; min = double.MaxValue; max = 0; lastOk = -1;
             chart.Data = new List<Probe>(); chart.Planned = s.Count; chart.InvalidateVisual();
             tLog.Clear();
@@ -998,6 +1006,16 @@ namespace IpQuality
             string line = string.Format("#{0,-5} {1}", r.Seq,
                 r.Ok ? LatencyChart.Ms(r.Ms).PadLeft(6) + " ms  " + r.Note : "  ——    " + r.Note);
             Log(line);
+
+            // TCP 第一次失败时提示原因：最常见的是端口没开放，或 NAT 机器填了内部端口而不是映射后的公网端口
+            if (cur.Tcp && !r.Ok && portHint == null && (r.Note == "超时" || r.Note == "端口拒绝连接"))
+            {
+                portHint = r.Note == "超时"
+                    ? "TCP " + cur.Port + " 连不上：这个端口可能没开放或被防火墙挡了；NAT 机器要填映射后的公网端口，也可以改用 ICMP Ping 试试"
+                    : "TCP " + cur.Port + " 被拒绝：服务器在线，但这个端口没有程序在监听，请核对端口";
+                Log("提示：" + portHint);
+                SetStatus(portHint, th.Warning);
+            }
         }
 
         void Log(string line)
@@ -1043,7 +1061,8 @@ namespace IpQuality
             }
             if (sent > 0) Log(Summary());
             double loss = sent == 0 ? 0 : (sent - recv) * 100.0 / sent;
-            SetStatus(word + " · " + pathText, sent > 0 && recv == 0 ? th.Critical : loss > 0 ? th.Warning : th.Good);
+            if (portHint != null && recv == 0) SetStatus(word + " · " + portHint, th.Critical);
+            else SetStatus(word + " · " + pathText, sent > 0 && recv == 0 ? th.Critical : loss > 0 ? th.Warning : th.Good);
         }
 
         void Copy()

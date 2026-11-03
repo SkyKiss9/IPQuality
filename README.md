@@ -56,6 +56,15 @@
 | ICMP 1.1.1.1 | 0.3–1.1 ms，TTL=255（代理软件本地代答） | 29 ms，TTL=49 |
 | TCP 1.1.1.1:443 | 约 0.9 ms（本地握手） | 超时（本地网络直连不通） |
 
+### 常见问题
+
+**TCP 测试一直超时，但节点明明能用？** 多半是端口填错了。NAT 机器的公网端口是映射出来的（比如公网 27443 → 机内 443），要填映射后的公网端口；或者直接用 ICMP Ping。TCP 第一次失败时软件会给出这条提示。
+
+### 更新记录
+
+- **1.0.1**：TCP 连不上或被拒绝时提示可能原因（端口没开放 / NAT 要填映射端口）；图表纵轴刻度格式统一；标题显示版本号。
+- **1.0.0**：首个版本。
+
 ### 自己编译
 
 不需要安装任何 SDK，用 Windows 自带的 C# 编译器：
@@ -126,6 +135,15 @@ Measured with v2rayN in TUN mode:
 |---|---|---|
 | ICMP 1.1.1.1 | 0.3–1.1 ms, TTL=255 (answered locally) | 29 ms, TTL=49 |
 | TCP 1.1.1.1:443 | ~0.9 ms (local handshake) | timeout (not reachable directly from this network) |
+
+### FAQ
+
+**TCP probes always time out, but the proxy node works?** Usually the port is wrong. On a NAT server the public port is a mapping (e.g. public 27443 → internal 443), so use the mapped public port, or just use ICMP ping. The app shows this hint on the first TCP failure.
+
+### Changelog
+
+- **1.0.1**: Hint with likely causes when a TCP probe times out or is refused (port closed / NAT needs the mapped port); consistent chart axis labels; version shown in the title bar.
+- **1.0.0**: First release.
 
 ### Build from source
 
