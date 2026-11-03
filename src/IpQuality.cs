@@ -1,0 +1,1065 @@
+// IP 质量测试：绿色单文件小工具。用 ICMP 或 TCP 连接测延迟、丢包、抖动；
+// 指定实体网卡后，测试包从这张网卡直接发出，不经过 v2rayN 的 TUN。
+// 不写注册表、不写配置文件、不常驻；关窗即退出进程。只支持 IPv4。
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Markup;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using Microsoft.Win32;
+
+namespace IpQuality
+{
+    static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            var app = new Application();
+            app.ShutdownMode = ShutdownMode.OnMainWindowClose;
+            app.Run(new MainWindow());
+        }
+    }
+
+    // ---------- 配色（取自 dataviz 参考色板：系列蓝、状态色、墨色层级、发丝线） ----------
+    class Theme
+    {
+        public bool Dark;
+        public Color Page, Surface, Border, Ink, Ink2, Muted, Grid, Baseline, Field, FieldBorder, Accent, Wash, Critical, Good, Warning, Scroll;
+
+        public static Theme Detect()
+        {
+            bool dark = false;
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k == null ? null : k.GetValue("AppsUseLightTheme");
+                    dark = v is int && (int)v == 0;
+                }
+            }
+            catch { }
+            var t = new Theme();
+            t.Dark = dark;
+            t.Critical = C("#d03b3b"); t.Good = C("#0ca30c"); t.Warning = C("#fab219");
+            if (dark)
+            {
+                t.Page = C("#0d0d0d"); t.Surface = C("#1a1a19"); t.Border = C("#1AFFFFFF");
+                t.Ink = C("#f0efec"); t.Ink2 = C("#c3c2b7"); t.Muted = C("#898781");
+                t.Grid = C("#2c2c2a"); t.Baseline = C("#383835");
+                t.Field = C("#222220"); t.FieldBorder = C("#3d3d3a");
+                t.Accent = C("#3987e5"); t.Wash = C("#1d2d42"); t.Scroll = C("#4a4a46");
+            }
+            else
+            {
+                t.Page = C("#f3f2ee"); t.Surface = C("#ffffff"); t.Border = C("#1A0B0B0B");
+                t.Ink = C("#0b0b0b"); t.Ink2 = C("#52514e"); t.Muted = C("#898781");
+                t.Grid = C("#e1e0d9"); t.Baseline = C("#c3c2b7");
+                t.Field = C("#ffffff"); t.FieldBorder = C("#d3d2cb");
+                t.Accent = C("#2a78d6"); t.Wash = C("#e8f1fc"); t.Scroll = C("#c9c8c1");
+            }
+            return t;
+        }
+
+        public static Color C(string hex) { return (Color)ColorConverter.ConvertFromString(hex); }
+        public static string Hex(Color c) { return string.Format("#{0:X2}{1:X2}{2:X2}{3:X2}", c.A, c.R, c.G, c.B); }
+        public static SolidColorBrush B(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
+        public static SolidColorBrush B(Color c, double alpha)
+        {
+            var b = new SolidColorBrush(Color.FromArgb((byte)(alpha * 255), c.R, c.G, c.B)); b.Freeze(); return b;
+        }
+    }
+
+    // ---------- 数据 ----------
+    class Probe
+    {
+        public int Seq;
+        public bool Ok;
+        public double Ms;
+        public string Note;
+    }
+
+    class Nic
+    {
+        public string Name, Desc;
+        public IPAddress Ip;
+        public int Index;
+        public bool Virtual, Gateway;
+    }
+
+    class Settings
+    {
+        public string TargetText;
+        public IPAddress Target;
+        public Nic Source;          // null = 按系统路由
+        public bool Tcp;
+        public int Port, Count, Interval, Timeout, Size;
+    }
+
+    // ---------- 网络 ----------
+    static class Net
+    {
+        const int IP_UNICAST_IF = 31;
+
+        public static List<Nic> LoadNics()
+        {
+            var list = new List<Nic>();
+            string[] virtualWords = { "tun", "tap", "wintun", "wireguard", "sing", "clash", "mihomo", "meta", "v2ray", "xray",
+                                      "vpn", "virtual", "vmware", "virtualbox", "hyper-v", "vethernet", "zerotier", "tailscale",
+                                      "npcap", "pseudo", "loopback" };
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                IPInterfaceProperties p;
+                IPv4InterfaceProperties v4;
+                try { p = ni.GetIPProperties(); v4 = p.GetIPv4Properties(); }
+                catch { continue; }
+                if (v4 == null) continue;
+                IPAddress ip = null;
+                foreach (var ua in p.UnicastAddresses)
+                {
+                    var b = ua.Address.GetAddressBytes();
+                    if (ua.Address.AddressFamily == AddressFamily.InterNetwork && !(b[0] == 169 && b[1] == 254)) { ip = ua.Address; break; }
+                }
+                if (ip == null) continue;
+                string s = (ni.Name + " " + ni.Description).ToLowerInvariant();
+                var n = new Nic();
+                n.Name = ni.Name; n.Desc = ni.Description; n.Ip = ip; n.Index = v4.Index;
+                n.Gateway = p.GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any));
+                n.Virtual = ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel || ni.NetworkInterfaceType == NetworkInterfaceType.Ppp
+                            || virtualWords.Any(w => s.Contains(w));
+                list.Add(n);
+            }
+            return list.OrderBy(n => n.Virtual ? 2 : (n.Gateway ? 0 : 1)).ToList();
+        }
+
+        // 绑定源地址 + IP_UNICAST_IF：两道保险，让包只从这张网卡出去
+        public static void BindTo(Socket s, Nic nic)
+        {
+            if (nic == null) return;
+            try { s.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)IP_UNICAST_IF, IPAddress.HostToNetworkOrder(nic.Index)); }
+            catch { }
+            s.Bind(new IPEndPoint(nic.Ip, 0));
+        }
+
+        // 域名解析：指定网卡时自己查（避开 v2rayN 的 fake-ip），否则用系统 DNS。
+        // v2rayN 的 strict_route 会拦截 TUN 以外的 53 端口，所以先走阿里 DoH（HTTPS 443），再试普通 UDP 53。
+        public static IPAddress Resolve(string host, Nic nic, out string via)
+        {
+            if (nic == null)
+            {
+                foreach (var a in Dns.GetHostAddresses(host))
+                    if (a.AddressFamily == AddressFamily.InterNetwork) { via = "系统 DNS"; return a; }
+                throw new Exception("这个域名没有 IPv4 地址");
+            }
+            string err = "域名解析失败";
+            foreach (var server in new[] { "223.5.5.5", "223.6.6.6" })
+            {
+                try
+                {
+                    var a = QueryDoh(host, server, nic);
+                    if (a != null) { via = "阿里 DNS " + server + "（HTTPS）"; return a; }
+                    err = "这个域名没有 IPv4 地址";
+                }
+                catch (Exception e)
+                {
+                    if (e.Message == "域名不存在") throw;
+                    err = "域名解析失败：" + e.Message;
+                }
+            }
+            foreach (var server in new[] { "223.5.5.5", "119.29.29.29" })
+            {
+                try
+                {
+                    var a = QueryA(host, IPAddress.Parse(server), nic);
+                    if (a != null) { via = server; return a; }
+                    err = "这个域名没有 IPv4 地址";
+                }
+                catch (Exception e) { if (!err.StartsWith("域名")) err = e.Message; }
+            }
+            throw new Exception(err);
+        }
+
+        static IPAddress QueryDoh(string host, string server, Nic nic)
+        {
+            if (!Regex.IsMatch(host, @"^[A-Za-z0-9.-]+$")) throw new Exception("域名格式不对");
+            var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            try
+            {
+                BindTo(s, nic);
+                s.SendTimeout = s.ReceiveTimeout = 3000;
+                var ar = s.BeginConnect(new IPEndPoint(IPAddress.Parse(server), 443), null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(3000)) throw new Exception("连不上 " + server);
+                s.EndConnect(ar);
+                using (var ssl = new System.Net.Security.SslStream(new NetworkStream(s, true), false))
+                {
+                    ssl.AuthenticateAsClient(server, null, System.Security.Authentication.SslProtocols.Tls12, true);
+                    var req = Encoding.ASCII.GetBytes("GET /resolve?name=" + host + "&type=1 HTTP/1.1\r\nHost: " + server + "\r\nConnection: close\r\n\r\n");
+                    ssl.Write(req);
+                    string body = new System.IO.StreamReader(ssl, Encoding.UTF8).ReadToEnd();
+                    if (Regex.IsMatch(body, "\"Status\"\\s*:\\s*3")) throw new Exception("域名不存在");
+                    var m = Regex.Match(body, "\"type\"\\s*:\\s*1\\s*,\\s*\"data\"\\s*:\\s*\"(\\d{1,3}(?:\\.\\d{1,3}){3})\"");
+                    return m.Success ? IPAddress.Parse(m.Groups[1].Value) : null;
+                }
+            }
+            finally { s.Close(); }
+        }
+
+        static IPAddress QueryA(string host, IPAddress server, Nic nic)
+        {
+            ushort id = (ushort)new Random().Next(1, 65535);
+            var q = new List<byte> { (byte)(id >> 8), (byte)id, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+            foreach (var label in host.TrimEnd('.').Split('.'))
+            {
+                var b = Encoding.ASCII.GetBytes(label);
+                if (b.Length == 0 || b.Length > 63) throw new Exception("域名格式不对");
+                q.Add((byte)b.Length); q.AddRange(b);
+            }
+            q.AddRange(new byte[] { 0, 0, 1, 0, 1 });
+            using (var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+            {
+                BindTo(s, nic);
+                s.ReceiveTimeout = 2000;
+                s.SendTo(q.ToArray(), new IPEndPoint(server, 53));
+                var buf = new byte[1500];
+                EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                int n = s.ReceiveFrom(buf, ref from);
+                if (n < 12 || buf[0] != (byte)(id >> 8) || buf[1] != (byte)id) throw new Exception("DNS 回复不对");
+                if ((buf[3] & 0xF) == 3) throw new Exception("域名不存在");
+                int qd = (buf[4] << 8) | buf[5], an = (buf[6] << 8) | buf[7], p = 12;
+                for (int i = 0; i < qd; i++) p = SkipName(buf, p) + 4;
+                for (int i = 0; i < an && p + 10 <= n; i++)
+                {
+                    p = SkipName(buf, p);
+                    int type = (buf[p] << 8) | buf[p + 1], len = (buf[p + 8] << 8) | buf[p + 9];
+                    p += 10;
+                    if (type == 1 && len == 4) return new IPAddress(new[] { buf[p], buf[p + 1], buf[p + 2], buf[p + 3] });
+                    p += len;
+                }
+                return null;
+            }
+        }
+
+        static int SkipName(byte[] b, int p)
+        {
+            while (true)
+            {
+                int len = b[p];
+                if (len == 0) return p + 1;
+                if ((len & 0xC0) == 0xC0) return p + 2;
+                p += len + 1;
+            }
+        }
+
+        public static Probe Tcp(IPAddress dst, int port, Nic nic, int timeout)
+        {
+            var r = new Probe();
+            using (var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+            {
+                try
+                {
+                    s.NoDelay = true;
+                    BindTo(s, nic);
+                    var sw = Stopwatch.StartNew();
+                    var ar = s.BeginConnect(new IPEndPoint(dst, port), null, null);
+                    bool done = ar.AsyncWaitHandle.WaitOne(timeout);
+                    double ms = sw.Elapsed.TotalMilliseconds;
+                    if (!done) { r.Note = "超时"; return r; }
+                    s.EndConnect(ar);
+                    r.Ok = true; r.Ms = ms; r.Note = "连接成功";
+                }
+                catch (SocketException e)
+                {
+                    r.Note = e.SocketErrorCode == SocketError.ConnectionRefused ? "端口拒绝连接"
+                           : e.SocketErrorCode == SocketError.NetworkUnreachable ? "网络不可达"
+                           : e.SocketErrorCode == SocketError.HostUnreachable ? "主机不可达"
+                           : "失败（" + e.SocketErrorCode + "）";
+                }
+            }
+            return r;
+        }
+    }
+
+    sealed class Icmp : IDisposable
+    {
+        [DllImport("iphlpapi.dll", SetLastError = true)] static extern IntPtr IcmpCreateFile();
+        [DllImport("iphlpapi.dll", SetLastError = true)] static extern bool IcmpCloseHandle(IntPtr h);
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        static extern uint IcmpSendEcho2Ex(IntPtr h, IntPtr evt, IntPtr apc, IntPtr apcCtx, uint src, uint dst,
+                                           IntPtr data, ushort size, IntPtr opts, IntPtr reply, uint replySize, uint timeout);
+
+        IntPtr handle, req, reply;
+        int size, replySize;
+
+        public Icmp(int size)
+        {
+            this.size = size;
+            handle = IcmpCreateFile();
+            if (handle == new IntPtr(-1)) throw new Exception("无法创建 ICMP 句柄");
+            var data = new byte[Math.Max(size, 1)];
+            for (int i = 0; i < data.Length; i++) data[i] = (byte)('a' + i % 23);
+            req = Marshal.AllocHGlobal(data.Length);
+            Marshal.Copy(data, 0, req, data.Length);
+            replySize = size + 512;
+            reply = Marshal.AllocHGlobal(replySize);
+        }
+
+        static uint Addr(IPAddress ip) { return ip == null ? 0u : BitConverter.ToUInt32(ip.GetAddressBytes(), 0); }
+
+        public Probe Send(IPAddress dst, Nic nic, int timeout)
+        {
+            var r = new Probe();
+            var sw = Stopwatch.StartNew();
+            uint n = IcmpSendEcho2Ex(handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, Addr(nic == null ? null : nic.Ip), Addr(dst),
+                                     req, (ushort)size, IntPtr.Zero, reply, (uint)replySize, (uint)timeout);
+            double ms = sw.Elapsed.TotalMilliseconds;
+            if (n == 0)
+            {
+                int err = Marshal.GetLastWin32Error();
+                r.Note = err == 11010 ? "超时" : StatusText((uint)err);
+                return r;
+            }
+            uint status = (uint)Marshal.ReadInt32(reply, 4);
+            if (status != 0)
+            {
+                var from = new IPAddress((long)(uint)Marshal.ReadInt32(reply, 0));
+                r.Note = StatusText(status) + "（来自 " + from + "）";
+                return r;
+            }
+            byte ttl = Marshal.ReadByte(reply, IntPtr.Size == 8 ? 24 : 20);
+            r.Ok = true; r.Ms = ms; r.Note = "TTL=" + ttl;
+            return r;
+        }
+
+        static string StatusText(uint s)
+        {
+            switch (s)
+            {
+                case 11002: return "目标网络不可达";
+                case 11003: return "目标主机不可达";
+                case 11004: return "协议不可达";
+                case 11005: return "端口不可达";
+                case 11010: return "超时";
+                case 11013: return "传输中 TTL 过期";
+                case 11018: return "目标地址无效";
+                case 1231: return "网络不可达";
+                case 1232: return "主机不可达";
+                default: return "失败（代码 " + s + "）";
+            }
+        }
+
+        public void Dispose()
+        {
+            if (handle != IntPtr.Zero) { IcmpCloseHandle(handle); handle = IntPtr.Zero; }
+            if (req != IntPtr.Zero) { Marshal.FreeHGlobal(req); req = IntPtr.Zero; }
+            if (reply != IntPtr.Zero) { Marshal.FreeHGlobal(reply); reply = IntPtr.Zero; }
+        }
+    }
+
+    // ---------- 延迟走势图：单系列折线 + 丢包竖条 + 悬停十字线与提示 ----------
+    class LatencyChart : FrameworkElement
+    {
+        const int Window = 600;
+        readonly Theme th;
+        readonly Brush ink, ink2, muted, surface, field, series, area, lossBand, critical;
+        readonly Pen grid, baseline, line, ring, cross, tipBorder;
+        public List<Probe> Data = new List<Probe>();
+        public int Planned;
+        int hover = -1;
+
+        public LatencyChart(Theme t)
+        {
+            th = t;
+            ink = Theme.B(t.Ink); ink2 = Theme.B(t.Ink2); muted = Theme.B(t.Muted); surface = Theme.B(t.Surface); field = Theme.B(t.Field);
+            series = Theme.B(t.Accent); area = Theme.B(t.Accent, 0.10); lossBand = Theme.B(t.Critical, 0.22); critical = Theme.B(t.Critical);
+            grid = P(t.Grid, 1); baseline = P(t.Baseline, 1); ring = P(t.Surface, 2); cross = P(t.Muted, 1); tipBorder = P(t.FieldBorder, 1);
+            line = new Pen(series, 2) { LineJoin = PenLineJoin.Round, StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round };
+            line.Freeze();
+            ClipToBounds = true;
+        }
+
+        static Pen P(Color c, double w) { var p = new Pen(Theme.B(c), w); p.Freeze(); return p; }
+
+        FormattedText Txt(string s, double size, Brush b, bool bold)
+        {
+            var tf = new Typeface(new FontFamily("Segoe UI, Microsoft YaHei UI"), FontStyles.Normal, bold ? FontWeights.SemiBold : FontWeights.Normal, FontStretches.Normal);
+            return new FormattedText(s, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, tf, size, b, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+        }
+
+        static double Nice(double raw)
+        {
+            if (raw <= 0) return 1;
+            double e = Math.Pow(10, Math.Floor(Math.Log10(raw))), f = raw / e;
+            return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
+        }
+
+        public static string Ms(double v) { return v < 10 ? v.ToString("0.0") : v < 1000 ? v.ToString("0") : v.ToString("#,0"); }
+
+        protected override void OnRender(DrawingContext dc)
+        {
+            double W = ActualWidth, H = ActualHeight;
+            dc.DrawRectangle(Brushes.Transparent, null, new Rect(0, 0, W, H));
+            int total = Data.Count, start = Math.Max(0, total - Window), shown = total - start;
+            int slots = Math.Max(shown, Planned > 0 && Planned <= Window ? Planned : shown);
+            if (slots == 0)
+            {
+                var e = Txt("输入 IP 后按回车或点「开始测试」", 13, muted, false);
+                dc.DrawText(e, new Point((W - e.Width) / 2, (H - e.Height) / 2));
+                return;
+            }
+
+            double maxMs = 0;
+            for (int i = start; i < total; i++) if (Data[i].Ok) maxMs = Math.Max(maxMs, Data[i].Ms);
+            if (maxMs <= 0) maxMs = 10;
+            double step = Nice(maxMs * 1.15 / 4), yMax = Math.Ceiling(maxMs * 1.15 / step) * step;
+
+            double labelW = Txt(Ms(yMax), 11, muted, false).Width;
+            double left = Math.Ceiling(labelW) + 10, right = W - 6, top = 8, bottom = H - 22;
+            if (bottom - top < 20 || right - left < 20) return;
+            Func<double, double> Y = v => bottom - v / yMax * (bottom - top);
+            double xs = (right - left) / slots;
+            Func<int, double> X = i => left + (i + 0.5) * xs;
+
+            for (double v = step; v <= yMax + step / 2; v += step)
+            {
+                double y = Math.Round(Y(v)) + 0.5;
+                dc.DrawLine(grid, new Point(left, y), new Point(right, y));
+                var t = Txt(Ms(v), 11, muted, false);
+                dc.DrawText(t, new Point(left - 8 - t.Width, y - t.Height / 2));
+            }
+            var z = Txt("0", 11, muted, false);
+            dc.DrawText(z, new Point(left - 8 - z.Width, bottom - z.Height / 2));
+
+            double bw = Math.Max(2, Math.Min(10, xs * 0.6));
+            for (int i = 0; i < shown; i++)
+                if (!Data[start + i].Ok) dc.DrawRectangle(lossBand, null, new Rect(X(i) - bw / 2, top, bw, bottom - top));
+
+            // 连续成功的点连成一段；遇到丢包断开，不跨丢包连线
+            int run = -1;
+            for (int i = 0; i <= shown; i++)
+            {
+                bool ok = i < shown && Data[start + i].Ok;
+                if (ok && run < 0) run = i;
+                if (!ok && run >= 0)
+                {
+                    if (i - run >= 2)
+                    {
+                        var ag = new StreamGeometry();
+                        using (var c = ag.Open())
+                        {
+                            c.BeginFigure(new Point(X(run), bottom), true, true);
+                            for (int k = run; k < i; k++) c.LineTo(new Point(X(k), Y(Data[start + k].Ms)), false, false);
+                            c.LineTo(new Point(X(i - 1), bottom), false, false);
+                        }
+                        dc.DrawGeometry(area, null, ag);
+                        var lg = new StreamGeometry();
+                        using (var c = lg.Open())
+                        {
+                            c.BeginFigure(new Point(X(run), Y(Data[start + run].Ms)), false, false);
+                            for (int k = run + 1; k < i; k++) c.LineTo(new Point(X(k), Y(Data[start + k].Ms)), true, true);
+                        }
+                        dc.DrawGeometry(null, line, lg);
+                    }
+                    run = -1;
+                }
+            }
+            dc.DrawLine(baseline, new Point(left, Math.Round(bottom) + 0.5), new Point(right, Math.Round(bottom) + 0.5));
+
+            int lastOk = -1;
+            for (int i = 0; i < shown; i++) if (Data[start + i].Ok) lastOk = i;
+            for (int i = 0; i < shown; i++)
+            {
+                var d = Data[start + i];
+                if (!d.Ok) continue;
+                bool isolated = (i == 0 || !Data[start + i - 1].Ok) && (i == shown - 1 || !Data[start + i + 1].Ok);
+                if (xs >= 10 || isolated || i == lastOk) dc.DrawEllipse(series, ring, new Point(X(i), Y(d.Ms)), 4, 4);
+            }
+
+            int every = (int)Math.Max(1, Nice(slots / 7.0));
+            for (int i = 0; i < slots; i++)
+            {
+                int seq = start + i + 1;
+                if (seq % every != 0 && i != 0) continue;
+                var t = Txt(seq.ToString(), 11, muted, false);
+                double x = Math.Max(left, Math.Min(right - t.Width, X(i) - t.Width / 2));
+                if (i == 0 || seq % every == 0) dc.DrawText(t, new Point(x, bottom + 5));
+            }
+
+            if (hover >= 0 && hover < shown)
+            {
+                var d = Data[start + hover];
+                double x = Math.Round(X(hover)) + 0.5;
+                dc.DrawLine(cross, new Point(x, top), new Point(x, bottom));
+                if (d.Ok) dc.DrawEllipse(series, ring, new Point(X(hover), Y(d.Ms)), 5, 5);
+                var t1 = Txt("第 " + d.Seq + " 次", 11, ink2, false);
+                var t2 = Txt(d.Ok ? Ms(d.Ms) + " ms" : d.Note, 13, ink, true);
+                double w = Math.Max(t1.Width, t2.Width + (d.Ok ? 0 : 14)) + 20, h = t1.Height + t2.Height + 14;
+                double bx = x + 12 + w > W ? x - 12 - w : x + 12, by = top + 4;
+                dc.DrawRoundedRectangle(field, tipBorder, new Rect(bx, by, w, h), 6, 6);
+                dc.DrawText(t1, new Point(bx + 10, by + 6));
+                double tx = bx + 10;
+                if (!d.Ok) { dc.DrawEllipse(critical, null, new Point(tx + 4, by + 8 + t1.Height + t2.Height / 2), 4, 4); tx += 14; }
+                dc.DrawText(t2, new Point(tx, by + 8 + t1.Height));
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            int total = Data.Count, start = Math.Max(0, total - Window), shown = total - start;
+            int slots = Math.Max(shown, Planned > 0 && Planned <= Window ? Planned : shown);
+            int h = -1;
+            if (shown > 0)
+            {
+                double labelW = 40, left = labelW, right = ActualWidth - 6;
+                // 与 OnRender 一致的左边距需要文字宽度；这里用近似值，只决定悬停到哪一个点
+                double maxMs = 0;
+                for (int i = start; i < total; i++) if (Data[i].Ok) maxMs = Math.Max(maxMs, Data[i].Ms);
+                if (maxMs <= 0) maxMs = 10;
+                double step = Nice(maxMs * 1.15 / 4), yMax = Math.Ceiling(maxMs * 1.15 / step) * step;
+                left = Math.Ceiling(Txt(Ms(yMax), 11, muted, false).Width) + 10;
+                double xs = (right - left) / slots;
+                int i2 = (int)Math.Floor((e.GetPosition(this).X - left) / xs);
+                if (i2 >= 0 && i2 < shown) h = i2;
+            }
+            if (h != hover) { hover = h; InvalidateVisual(); }
+        }
+
+        protected override void OnMouseLeave(MouseEventArgs e)
+        {
+            if (hover != -1) { hover = -1; InvalidateVisual(); }
+        }
+    }
+
+    // ---------- 主窗口 ----------
+    class MainWindow : Window
+    {
+        [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        const string Xaml = @"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+      Background='$PAGE$' TextElement.FontFamily='Segoe UI, Microsoft YaHei UI' TextElement.FontSize='13' TextElement.Foreground='$INK$'>
+ <Grid.Resources>
+  <Style x:Key='Card' TargetType='Border'>
+   <Setter Property='Background' Value='$SURFACE$'/><Setter Property='BorderBrush' Value='$BORDER$'/>
+   <Setter Property='BorderThickness' Value='1'/><Setter Property='CornerRadius' Value='10'/><Setter Property='Padding' Value='16'/>
+  </Style>
+  <Style x:Key='Cap' TargetType='TextBlock'>
+   <Setter Property='Foreground' Value='$MUTED$'/><Setter Property='FontSize' Value='12'/><Setter Property='Margin' Value='0,0,0,5'/>
+  </Style>
+  <Style x:Key='Val' TargetType='TextBlock'>
+   <Setter Property='FontSize' Value='20'/><Setter Property='FontWeight' Value='SemiBold'/>
+  </Style>
+  <Style TargetType='TextBox'>
+   <Setter Property='Foreground' Value='$INK$'/><Setter Property='CaretBrush' Value='$INK$'/><Setter Property='SelectionBrush' Value='$ACCENT$'/>
+   <Setter Property='Background' Value='$FIELD$'/><Setter Property='BorderBrush' Value='$FIELDBORDER$'/><Setter Property='BorderThickness' Value='1'/>
+   <Setter Property='Padding' Value='6,0'/><Setter Property='Height' Value='34'/><Setter Property='VerticalContentAlignment' Value='Center'/>
+   <Setter Property='Template'><Setter.Value>
+    <ControlTemplate TargetType='TextBox'>
+     <Border x:Name='B' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='{TemplateBinding BorderThickness}' CornerRadius='6'>
+      <ScrollViewer x:Name='PART_ContentHost' Margin='{TemplateBinding Padding}' VerticalAlignment='{TemplateBinding VerticalContentAlignment}'/>
+     </Border>
+     <ControlTemplate.Triggers>
+      <Trigger Property='IsKeyboardFocused' Value='True'><Setter TargetName='B' Property='BorderBrush' Value='$ACCENT$'/></Trigger>
+      <Trigger Property='IsEnabled' Value='False'><Setter TargetName='B' Property='Opacity' Value='0.5'/></Trigger>
+     </ControlTemplate.Triggers>
+    </ControlTemplate>
+   </Setter.Value></Setter>
+  </Style>
+  <Style x:Key='Primary' TargetType='Button'>
+   <Setter Property='Foreground' Value='#FFFFFFFF'/><Setter Property='Background' Value='$ACCENT$'/><Setter Property='FontWeight' Value='SemiBold'/>
+   <Setter Property='Padding' Value='22,0'/><Setter Property='Height' Value='34'/><Setter Property='Cursor' Value='Hand'/><Setter Property='Focusable' Value='False'/>
+   <Setter Property='Template'><Setter.Value>
+    <ControlTemplate TargetType='Button'>
+     <Border x:Name='B' Background='{TemplateBinding Background}' CornerRadius='6' Padding='{TemplateBinding Padding}'>
+      <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/>
+     </Border>
+     <ControlTemplate.Triggers>
+      <Trigger Property='IsMouseOver' Value='True'><Setter TargetName='B' Property='Opacity' Value='0.9'/></Trigger>
+      <Trigger Property='IsPressed' Value='True'><Setter TargetName='B' Property='Opacity' Value='0.78'/></Trigger>
+     </ControlTemplate.Triggers>
+    </ControlTemplate>
+   </Setter.Value></Setter>
+  </Style>
+  <Style x:Key='Ghost' TargetType='Button'>
+   <Setter Property='Foreground' Value='$INK2$'/><Setter Property='Padding' Value='12,0'/><Setter Property='Height' Value='28'/>
+   <Setter Property='FontSize' Value='12'/><Setter Property='Cursor' Value='Hand'/><Setter Property='Focusable' Value='False'/>
+   <Setter Property='Template'><Setter.Value>
+    <ControlTemplate TargetType='Button'>
+     <Border x:Name='B' Background='Transparent' BorderBrush='$FIELDBORDER$' BorderThickness='1' CornerRadius='6' Padding='{TemplateBinding Padding}'>
+      <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/>
+     </Border>
+     <ControlTemplate.Triggers>
+      <Trigger Property='IsMouseOver' Value='True'><Setter TargetName='B' Property='Background' Value='$WASH$'/></Trigger>
+     </ControlTemplate.Triggers>
+    </ControlTemplate>
+   </Setter.Value></Setter>
+  </Style>
+  <Style x:Key='Pill' TargetType='RadioButton'>
+   <Setter Property='Foreground' Value='$INK2$'/><Setter Property='Margin' Value='0,0,6,6'/><Setter Property='Cursor' Value='Hand'/><Setter Property='Focusable' Value='False'/>
+   <Setter Property='Template'><Setter.Value>
+    <ControlTemplate TargetType='RadioButton'>
+     <Border x:Name='B' Background='$FIELD$' BorderBrush='$FIELDBORDER$' BorderThickness='1' CornerRadius='6' Padding='12,0' MinHeight='34'>
+      <ContentPresenter VerticalAlignment='Center'/>
+     </Border>
+     <ControlTemplate.Triggers>
+      <Trigger Property='IsMouseOver' Value='True'><Setter TargetName='B' Property='BorderBrush' Value='$MUTED$'/></Trigger>
+      <Trigger Property='IsChecked' Value='True'>
+       <Setter TargetName='B' Property='Background' Value='$WASH$'/><Setter TargetName='B' Property='BorderBrush' Value='$ACCENT$'/>
+       <Setter Property='Foreground' Value='$INK$'/>
+      </Trigger>
+      <Trigger Property='IsEnabled' Value='False'><Setter TargetName='B' Property='Opacity' Value='0.5'/></Trigger>
+     </ControlTemplate.Triggers>
+    </ControlTemplate>
+   </Setter.Value></Setter>
+  </Style>
+  <Style TargetType='ScrollBar'>
+   <Style.Triggers>
+    <Trigger Property='Orientation' Value='Vertical'>
+     <Setter Property='Width' Value='8'/><Setter Property='MinWidth' Value='8'/>
+     <Setter Property='Template'><Setter.Value>
+      <ControlTemplate TargetType='ScrollBar'>
+       <Track x:Name='PART_Track' IsDirectionReversed='True'>
+        <Track.Thumb><Thumb><Thumb.Template><ControlTemplate TargetType='Thumb'><Border Background='$SCROLL$' CornerRadius='4'/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+       </Track>
+      </ControlTemplate>
+     </Setter.Value></Setter>
+    </Trigger>
+   </Style.Triggers>
+  </Style>
+ </Grid.Resources>
+
+ <Grid Margin='18'>
+  <Grid.RowDefinitions>
+   <RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*' MinHeight='170'/><RowDefinition Height='170'/>
+  </Grid.RowDefinitions>
+
+  <Border Style='{StaticResource Card}'>
+   <StackPanel>
+    <Grid>
+     <Grid.ColumnDefinitions>
+      <ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/>
+     </Grid.ColumnDefinitions>
+     <StackPanel Margin='0,0,14,0'>
+      <TextBlock Style='{StaticResource Cap}' Text='目标 IP 或域名'/>
+      <TextBox x:Name='TTarget' FontSize='15'/>
+     </StackPanel>
+     <StackPanel Grid.Column='1' Margin='0,0,14,0'>
+      <TextBlock Style='{StaticResource Cap}' Text='测试方式'/>
+      <StackPanel Orientation='Horizontal'>
+       <RadioButton x:Name='RIcmp' GroupName='mode' Style='{StaticResource Pill}' Content='ICMP Ping' IsChecked='True' Margin='0,0,6,0'/>
+       <RadioButton x:Name='RTcp' GroupName='mode' Style='{StaticResource Pill}' Content='TCP 连接' Margin='0'/>
+      </StackPanel>
+     </StackPanel>
+     <StackPanel Grid.Column='2' Margin='0,0,14,0'>
+      <TextBlock Style='{StaticResource Cap}' Text='TCP 端口'/>
+      <TextBox x:Name='TPort' Width='72' Text='443'/>
+     </StackPanel>
+     <Button x:Name='BStart' Grid.Column='3' Style='{StaticResource Primary}' Content='开始测试' VerticalAlignment='Bottom' MinWidth='112'/>
+    </Grid>
+    <WrapPanel Margin='0,14,0,0'>
+     <StackPanel Margin='0,0,14,0'><TextBlock Style='{StaticResource Cap}' Text='次数（0 = 一直测）'/><TextBox x:Name='TCount' Width='118' Text='20'/></StackPanel>
+     <StackPanel Margin='0,0,14,0'><TextBlock Style='{StaticResource Cap}' Text='间隔（毫秒）'/><TextBox x:Name='TInterval' Width='118' Text='1000'/></StackPanel>
+     <StackPanel Margin='0,0,14,0'><TextBlock Style='{StaticResource Cap}' Text='超时（毫秒）'/><TextBox x:Name='TTimeout' Width='118' Text='2000'/></StackPanel>
+     <StackPanel Margin='0,0,14,0'><TextBlock Style='{StaticResource Cap}' Text='Ping 包大小（字节）'/><TextBox x:Name='TSize' Width='118' Text='32'/></StackPanel>
+    </WrapPanel>
+    <TextBlock Style='{StaticResource Cap}' Text='从哪张网卡发出' Margin='0,14,0,5'/>
+    <WrapPanel x:Name='WNics'/>
+    <TextBlock x:Name='TNicHint' Foreground='$INK2$' FontSize='12' TextWrapping='Wrap' Margin='0,2,0,0'/>
+   </StackPanel>
+  </Border>
+
+  <Border Grid.Row='1' Style='{StaticResource Card}' Margin='0,12,0,0'>
+   <StackPanel>
+    <Grid>
+     <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+     <StackPanel Margin='0,0,32,0' MinWidth='150'>
+      <TextBlock Style='{StaticResource Cap}' Text='平均延迟'/>
+      <StackPanel Orientation='Horizontal'>
+       <TextBlock x:Name='VAvg' Text='—' FontSize='44' FontWeight='SemiBold'/>
+       <TextBlock Text='ms' FontSize='16' Foreground='$INK2$' VerticalAlignment='Bottom' Margin='6,0,0,10'/>
+      </StackPanel>
+     </StackPanel>
+     <UniformGrid Grid.Column='1' Rows='1' VerticalAlignment='Center'>
+      <StackPanel>
+       <TextBlock Style='{StaticResource Cap}' Text='丢包率'/>
+       <StackPanel Orientation='Horizontal'>
+        <Ellipse x:Name='LossDot' Width='9' Height='9' Fill='$MUTED$' Margin='0,0,7,0' VerticalAlignment='Center'/>
+        <TextBlock x:Name='VLoss' Style='{StaticResource Val}' Text='—'/>
+       </StackPanel>
+      </StackPanel>
+      <StackPanel><TextBlock Style='{StaticResource Cap}' Text='最小'/><TextBlock x:Name='VMin' Style='{StaticResource Val}' Text='—'/></StackPanel>
+      <StackPanel><TextBlock Style='{StaticResource Cap}' Text='最大'/><TextBlock x:Name='VMax' Style='{StaticResource Val}' Text='—'/></StackPanel>
+      <StackPanel><TextBlock Style='{StaticResource Cap}' Text='抖动'/><TextBlock x:Name='VJit' Style='{StaticResource Val}' Text='—'/></StackPanel>
+      <StackPanel><TextBlock Style='{StaticResource Cap}' Text='已收 / 已发'/><TextBlock x:Name='VCount' Style='{StaticResource Val}' Text='—'/></StackPanel>
+     </UniformGrid>
+    </Grid>
+    <StackPanel Orientation='Horizontal' Margin='0,12,0,0'>
+     <Ellipse x:Name='StatusDot' Width='8' Height='8' Fill='$MUTED$' Margin='0,0,8,0' VerticalAlignment='Center'/>
+     <TextBlock x:Name='TStatus' Foreground='$INK2$' FontSize='12' TextWrapping='Wrap' Text='就绪'/>
+    </StackPanel>
+   </StackPanel>
+  </Border>
+
+  <Border Grid.Row='2' Style='{StaticResource Card}' Margin='0,12,0,0' Padding='16,12,16,10'>
+   <Grid>
+    <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/></Grid.RowDefinitions>
+    <DockPanel>
+     <StackPanel DockPanel.Dock='Right' Orientation='Horizontal' VerticalAlignment='Center'>
+      <Rectangle Width='6' Height='12' Fill='$LOSSBAND$' Margin='0,0,6,0'/>
+      <TextBlock Text='丢包 / 超时' Foreground='$MUTED$' FontSize='12'/>
+     </StackPanel>
+     <TextBlock Text='延迟走势（ms）' FontWeight='SemiBold'/>
+    </DockPanel>
+    <ContentControl x:Name='ChartHost' Grid.Row='1' Margin='0,8,0,0' Focusable='False'/>
+   </Grid>
+  </Border>
+
+  <Border Grid.Row='3' Style='{StaticResource Card}' Margin='0,12,0,0' Padding='16,10,10,10'>
+   <Grid>
+    <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/></Grid.RowDefinitions>
+    <DockPanel Margin='0,0,6,0'>
+     <Button x:Name='BCopy' DockPanel.Dock='Right' Style='{StaticResource Ghost}' Content='复制结果'/>
+     <TextBlock Text='逐次结果' FontWeight='SemiBold' VerticalAlignment='Center'/>
+    </DockPanel>
+    <TextBox x:Name='TLog' Grid.Row='1' Margin='0,6,0,0' IsReadOnly='True' BorderThickness='0' Background='Transparent' Padding='0' Height='Auto'
+             VerticalContentAlignment='Stretch' TextWrapping='Wrap' VerticalScrollBarVisibility='Auto' HorizontalScrollBarVisibility='Disabled'
+             FontFamily='Consolas, Microsoft YaHei UI' FontSize='12' Foreground='$INK2$'/>
+   </Grid>
+  </Border>
+ </Grid>
+</Grid>";
+
+        readonly Theme th;
+        readonly FrameworkElement root;
+        readonly TextBox tTarget, tPort, tCount, tInterval, tTimeout, tSize, tLog;
+        readonly RadioButton rIcmp, rTcp;
+        readonly Button bStart, bCopy;
+        readonly WrapPanel wNics;
+        readonly TextBlock tNicHint, vAvg, vLoss, vMin, vMax, vJit, vCount, tStatus;
+        readonly Ellipse lossDot, statusDot;
+        readonly LatencyChart chart;
+        readonly List<RadioButton> nicButtons = new List<RadioButton>();
+        List<Nic> nics = new List<Nic>();
+
+        ManualResetEvent stopEvt;
+        bool running;
+        Settings cur;
+        string pathText = "";
+        int sent, recv, jitN;
+        double sum, min, max, jitSum, lastOk = -1;
+
+        T F<T>(string name) where T : class { return root.FindName(name) as T; }
+
+        public MainWindow()
+        {
+            th = Theme.Detect();
+            Title = "IP 质量测试";
+            Width = 960; Height = 860; MinWidth = 800; MinHeight = 720;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            UseLayoutRounding = true;
+            Background = Theme.B(th.Page);
+
+            string x = Xaml
+                .Replace("$PAGE$", Theme.Hex(th.Page)).Replace("$SURFACE$", Theme.Hex(th.Surface)).Replace("$BORDER$", Theme.Hex(th.Border))
+                .Replace("$INK$", Theme.Hex(th.Ink)).Replace("$INK2$", Theme.Hex(th.Ink2)).Replace("$MUTED$", Theme.Hex(th.Muted))
+                .Replace("$FIELD$", Theme.Hex(th.Field)).Replace("$FIELDBORDER$", Theme.Hex(th.FieldBorder))
+                .Replace("$ACCENT$", Theme.Hex(th.Accent)).Replace("$WASH$", Theme.Hex(th.Wash)).Replace("$SCROLL$", Theme.Hex(th.Scroll))
+                .Replace("$LOSSBAND$", Theme.Hex(Color.FromArgb(56, th.Critical.R, th.Critical.G, th.Critical.B)));
+            root = (FrameworkElement)XamlReader.Parse(x);
+            Content = root;
+
+            tTarget = F<TextBox>("TTarget"); tPort = F<TextBox>("TPort"); tCount = F<TextBox>("TCount");
+            tInterval = F<TextBox>("TInterval"); tTimeout = F<TextBox>("TTimeout"); tSize = F<TextBox>("TSize"); tLog = F<TextBox>("TLog");
+            rIcmp = F<RadioButton>("RIcmp"); rTcp = F<RadioButton>("RTcp");
+            bStart = F<Button>("BStart"); bCopy = F<Button>("BCopy");
+            wNics = F<WrapPanel>("WNics"); tNicHint = F<TextBlock>("TNicHint");
+            vAvg = F<TextBlock>("VAvg"); vLoss = F<TextBlock>("VLoss"); vMin = F<TextBlock>("VMin");
+            vMax = F<TextBlock>("VMax"); vJit = F<TextBlock>("VJit"); vCount = F<TextBlock>("VCount");
+            tStatus = F<TextBlock>("TStatus"); lossDot = F<Ellipse>("LossDot"); statusDot = F<Ellipse>("StatusDot");
+            chart = new LatencyChart(th);
+            F<ContentControl>("ChartHost").Content = chart;
+
+            bStart.Click += delegate { if (running) Stop(); else Start(); };
+            bCopy.Click += delegate { Copy(); };
+            rIcmp.Checked += delegate { ModeChanged(); };
+            rTcp.Checked += delegate { ModeChanged(); };
+            PreviewKeyDown += OnKey;
+            SourceInitialized += delegate
+            {
+                if (!th.Dark) return;
+                int on = 1;
+                try { DwmSetWindowAttribute(new WindowInteropHelper(this).Handle, 20, ref on, 4); } catch { }
+            };
+            Loaded += delegate { tTarget.Focus(); };
+
+            LoadNicButtons();
+            ModeChanged();
+        }
+
+        void LoadNicButtons()
+        {
+            try { nics = Net.LoadNics(); } catch { nics = new List<Nic>(); }
+            wNics.Children.Clear(); nicButtons.Clear();
+            var pill = (Style)root.FindResource("Pill");
+            foreach (var n in nics)
+            {
+                string text = n.Name + " · " + n.Ip + (n.Virtual ? "（虚拟网卡）" : "");
+                var rb = new RadioButton { Style = pill, GroupName = "nic", Content = text, Tag = n, ToolTip = n.Desc };
+                rb.Checked += delegate { NicChanged(); };
+                wNics.Children.Add(rb); nicButtons.Add(rb);
+            }
+            var sys = new RadioButton { Style = pill, GroupName = "nic", Content = "不指定（按系统路由）", Tag = null };
+            sys.Checked += delegate { NicChanged(); };
+            wNics.Children.Add(sys); nicButtons.Add(sys);
+            var best = nicButtons.FirstOrDefault(b => b.Tag != null && !((Nic)b.Tag).Virtual);
+            (best ?? sys).IsChecked = true;
+            NicChanged();
+        }
+
+        Nic SelectedNic()
+        {
+            var b = nicButtons.FirstOrDefault(r => r.IsChecked == true);
+            return b == null ? null : b.Tag as Nic;
+        }
+
+        void NicChanged()
+        {
+            var n = SelectedNic();
+            if (n == null)
+                tNicHint.Text = "按 Windows 路由表发出。v2rayN 开着 TUN 时会被它接管，TCP 结果只是本机到 v2rayN 的时间，不可信。";
+            else if (n.Virtual)
+                tNicHint.Text = "这是虚拟网卡（代理或隧道），测到的是走这条隧道的结果，不是本机直连。";
+            else
+                tNicHint.Text = "测试包从「" + n.Name + "」直接发出，不经过 v2rayN（TUN 模式也绕得开）；域名经这张网卡用阿里 DNS（HTTPS）解析。";
+        }
+
+        void ModeChanged()
+        {
+            bool tcp = rTcp.IsChecked == true;
+            tPort.IsEnabled = tcp && !running;
+            tSize.IsEnabled = !tcp && !running;
+        }
+
+        void OnKey(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter && !running) { Start(); e.Handled = true; }
+            else if (e.Key == Key.Escape && running) { Stop(); e.Handled = true; }
+        }
+
+        void SetStatus(string text, Color dot)
+        {
+            tStatus.Text = text;
+            statusDot.Fill = Theme.B(dot);
+        }
+
+        bool ReadInt(TextBox t, string name, int lo, int hi, out int v)
+        {
+            if (int.TryParse(t.Text.Trim(), out v) && v >= lo && v <= hi) return true;
+            SetStatus(name + "要填 " + lo + " 到 " + hi + " 之间的整数", th.Critical);
+            t.Focus(); t.SelectAll();
+            return false;
+        }
+
+        void Start()
+        {
+            var s = new Settings();
+            string target = tTarget.Text.Trim();
+            if (target.Length == 0) { SetStatus("先填要测的 IP 或域名", th.Critical); tTarget.Focus(); return; }
+
+            // 支持直接粘贴 “IP:端口”，自动切到 TCP
+            var m = Regex.Match(target, @"^([^:\s]+):(\d{1,5})$");
+            if (m.Success) { target = m.Groups[1].Value; tPort.Text = m.Groups[2].Value; rTcp.IsChecked = true; tTarget.Text = target; }
+            if (target.Contains(":")) { SetStatus("只支持 IPv4", th.Critical); return; }
+
+            s.TargetText = target;
+            s.Tcp = rTcp.IsChecked == true;
+            s.Source = SelectedNic();
+            int v;
+            if (!ReadInt(tCount, "次数", 0, 1000000, out v)) return; s.Count = v;
+            if (!ReadInt(tInterval, "间隔", 100, 600000, out v)) return; s.Interval = v;
+            if (!ReadInt(tTimeout, "超时", 100, 60000, out v)) return; s.Timeout = v;
+            if (s.Tcp) { if (!ReadInt(tPort, "端口", 1, 65535, out v)) return; s.Port = v; }
+            else { if (!ReadInt(tSize, "包大小", 0, 65500, out v)) return; s.Size = v; }
+
+            cur = s;
+            sent = recv = jitN = 0; sum = jitSum = 0; min = double.MaxValue; max = 0; lastOk = -1;
+            chart.Data = new List<Probe>(); chart.Planned = s.Count; chart.InvalidateVisual();
+            tLog.Clear();
+            UpdateStats();
+            SetRunning(true);
+            SetStatus("正在解析 " + target + " …", th.Accent);
+
+            stopEvt = new ManualResetEvent(false);
+            var stop = stopEvt;
+            var t = new Thread(() => Work(s, stop));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        void Stop()
+        {
+            if (stopEvt != null) stopEvt.Set();
+        }
+
+        void SetRunning(bool on)
+        {
+            running = on;
+            bStart.Content = on ? "停止" : "开始测试";
+            bStart.Background = Theme.B(on ? th.Critical : th.Accent);
+            foreach (var c in new UIElement[] { tTarget, tCount, tInterval, tTimeout, rIcmp, rTcp }) c.IsEnabled = !on;
+            foreach (var b in nicButtons) b.IsEnabled = !on;
+            ModeChanged();
+        }
+
+        void Ui(Action a) { Dispatcher.BeginInvoke(a); }
+
+        void Work(Settings s, ManualResetEvent stop)
+        {
+            Icmp icmp = null;
+            try
+            {
+                IPAddress ip;
+                string via = null;
+                if (Regex.IsMatch(s.TargetText, @"^\d{1,3}(\.\d{1,3}){3}$"))
+                {
+                    if (!IPAddress.TryParse(s.TargetText, out ip)) throw new Exception("IP 格式不对");
+                }
+                else ip = Net.Resolve(s.TargetText, s.Source, out via);
+                s.Target = ip;
+
+                var b = ip.GetAddressBytes();
+                bool fake = b[0] == 198 && (b[1] == 18 || b[1] == 19);
+                string from = s.Source == null ? "本机（系统路由）" : "本机 " + s.Source.Ip + "（" + s.Source.Name + "）";
+                string to = via == null ? ip.ToString() : s.TargetText + "（" + ip + "，经 " + via + " 解析）";
+                string mode = s.Tcp ? "TCP " + s.Port : "ICMP " + s.Size + " 字节";
+                string route = s.Source == null ? "可能经过 v2rayN" : s.Source.Virtual ? "走虚拟网卡" : "绕过 v2rayN";
+                string path = from + " → " + to + " · " + mode + " · " + route;
+                Ui(() =>
+                {
+                    pathText = path;
+                    SetStatus(fake ? path + "。注意：这是 v2rayN 的虚拟地址（fake-ip），结果不代表真实服务器" : path, fake ? th.Warning : th.Accent);
+                    Log("开始 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + path);
+                });
+
+                if (!s.Tcp) icmp = new Icmp(s.Size);
+                var clock = Stopwatch.StartNew();
+                for (int i = 1; s.Count == 0 || i <= s.Count; i++)
+                {
+                    if (stop.WaitOne(0)) break;
+                    double t0 = clock.Elapsed.TotalMilliseconds;
+                    var r = s.Tcp ? Net.Tcp(ip, s.Port, s.Source, s.Timeout) : icmp.Send(ip, s.Source, s.Timeout);
+                    r.Seq = i;
+                    Ui(() => Add(r));
+                    if (s.Count != 0 && i == s.Count) break;
+                    double wait = s.Interval - (clock.Elapsed.TotalMilliseconds - t0);
+                    if (wait > 0 && stop.WaitOne((int)wait)) break;
+                }
+                bool stopped = stop.WaitOne(0);
+                Ui(() => Finish(stopped ? "已停止" : "完成", null));
+            }
+            catch (Exception e)
+            {
+                string msg = e.Message;
+                Ui(() => Finish(null, msg));
+            }
+            finally
+            {
+                if (icmp != null) icmp.Dispose();
+            }
+        }
+
+        void Add(Probe r)
+        {
+            if (cur == null) return;
+            sent++;
+            if (r.Ok)
+            {
+                recv++; sum += r.Ms; min = Math.Min(min, r.Ms); max = Math.Max(max, r.Ms);
+                if (lastOk >= 0) { jitSum += Math.Abs(r.Ms - lastOk); jitN++; }
+                lastOk = r.Ms;
+            }
+            chart.Data.Add(r);
+            chart.InvalidateVisual();
+            UpdateStats();
+            string line = string.Format("#{0,-5} {1}", r.Seq,
+                r.Ok ? LatencyChart.Ms(r.Ms).PadLeft(6) + " ms  " + r.Note : "  ——    " + r.Note);
+            Log(line);
+        }
+
+        void Log(string line)
+        {
+            if (tLog.Text.Length > 300000) tLog.Text = tLog.Text.Substring(tLog.Text.Length - 200000);
+            tLog.AppendText((tLog.Text.Length == 0 ? "" : "\r\n") + line);
+            tLog.ScrollToEnd();
+        }
+
+        void UpdateStats()
+        {
+            if (sent == 0)
+            {
+                vAvg.Text = vLoss.Text = vMin.Text = vMax.Text = vJit.Text = vCount.Text = "—";
+                lossDot.Fill = Theme.B(th.Muted);
+                return;
+            }
+            double loss = (sent - recv) * 100.0 / sent;
+            vLoss.Text = loss.ToString(loss == 0 || loss == 100 ? "0" : "0.0") + "%";
+            lossDot.Fill = Theme.B(loss == 0 ? th.Good : loss < 5 ? th.Warning : th.Critical);
+            vCount.Text = recv + " / " + sent;
+            vAvg.Text = recv > 0 ? LatencyChart.Ms(sum / recv) : "—";
+            vMin.Text = recv > 0 ? LatencyChart.Ms(min) + " ms" : "—";
+            vMax.Text = recv > 0 ? LatencyChart.Ms(max) + " ms" : "—";
+            vJit.Text = jitN > 0 ? LatencyChart.Ms(jitSum / jitN) + " ms" : "—";
+        }
+
+        string Summary()
+        {
+            if (sent == 0) return "";
+            return string.Format("统计：已发 {0}，已收 {1}，丢包 {2}；最小 {3} / 平均 {4} / 最大 {5} / 抖动 {6}",
+                sent, recv, vLoss.Text, vMin.Text, recv > 0 ? vAvg.Text + " ms" : "—", vMax.Text, vJit.Text);
+        }
+
+        void Finish(string word, string error)
+        {
+            SetRunning(false);
+            if (error != null)
+            {
+                SetStatus(error, th.Critical);
+                Log("出错：" + error);
+                return;
+            }
+            if (sent > 0) Log(Summary());
+            double loss = sent == 0 ? 0 : (sent - recv) * 100.0 / sent;
+            SetStatus(word + " · " + pathText, sent > 0 && recv == 0 ? th.Critical : loss > 0 ? th.Warning : th.Good);
+        }
+
+        void Copy()
+        {
+            string text = tLog.Text;
+            if (text.Length == 0) { SetStatus("还没有结果可复制", th.Muted); return; }
+            if (running && sent > 0) text += "\r\n" + Summary();
+            try { Clipboard.SetText(text); SetStatus("结果已复制到剪贴板", th.Good); }
+            catch { SetStatus("剪贴板被占用，稍后再试", th.Warning); }
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            Stop();
+            base.OnClosed(e);
+            Environment.Exit(0);
+        }
+    }
+}
