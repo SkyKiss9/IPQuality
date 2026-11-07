@@ -8,9 +8,9 @@
 
 ## 中文
 
-一个 Windows 绿色小工具，用来测试**本机到某个 IP 的网络质量**：延迟、丢包率、抖动。
+一个 Windows 绿色小工具，用来测试**本机到某个 IP 的网络质量**：延迟、丢包率、抖动，以及**逐跳路由追踪**（每一跳的丢包和延迟）。
 
-- **绿色单文件**：只有一个约 90 KB 的 exe，不用安装，双击就开。
+- **绿色单文件**：只有一个约 110 KB 的 exe，不用安装，双击就开。
 - **不留痕迹**：不写注册表、不写配置文件、不常驻后台，关掉窗口进程就退出。
 - **能绕过代理软件**：v2rayN、Clash 等开着 TUN 模式时，普通 ping 会被它们接管，测出来的是假结果。这个工具可以指定从实体网卡（Wi‑Fi / 网线）直接发包，测到的才是真实网络质量。
 
@@ -18,7 +18,7 @@
 
 | 项目 | 说明 |
 |---|---|
-| 测试方式 | **ICMP Ping**，或 **TCP 连接**（测指定端口的握手时间，适合禁 ping 的服务器） |
+| 测试方式 | **ICMP Ping**；**TCP 连接**（测指定端口的握手时间，适合禁 ping 的服务器）；**路由追踪**（逐跳统计，见下） |
 | 目标 | IPv4 地址或域名；直接粘贴 `IP:端口` 会自动切到 TCP |
 | 参数 | 次数（0 = 一直测）、间隔、超时、Ping 包大小 |
 | 出口网卡 | 自动选中实体网卡；也可以选「不指定（按系统路由）」做对比 |
@@ -29,6 +29,23 @@
 快捷键：回车开始，Esc 停止。
 
 ![Packet loss](docs/screenshot-loss.png)
+
+### 路由追踪（1.1.0 新增）
+
+像 mtr / itdog 一样，每一轮同时探测第 1–30 跳，持续统计每一跳的情况：
+
+- 每跳的 IP、归属（地区 · AS · 运营商，常见运营商用中文简称）、丢包率、已发次数、最新 / 最快 / 最慢 / 平均延迟；
+- 「最近 N 轮」回应条：绿线 = 有回应，红色竖条 = 那一轮没回应，看得出丢包集中在什么时候；窗口越宽能看的轮数越多（最多 300 轮）；
+- 到达终点后只探测到终点那一跳，底色那一行就是终点；上方的平均延迟、丢包率卡片也只算终点；
+- 一次都不回应的跳显示灰色「不回应 ping」，不算丢包；
+- 中间某跳丢包、但后面各跳和终点都不丢，是那台路由器限速回复 ICMP，不是真丢包——**以终点一行为准**（下图第 5 跳 80%，终点 0%，就是这种情况）；
+- 表头固定、默认自动跟随到终点；窗口不够宽时表格可以左右滚动；「复制结果」会附上整张逐跳表。
+
+归属地查询会把各跳的 IP（只有 IP 本身）发给 [ip-api.com](https://ip-api.com)；局域网和运营商内网地址在本地判断，不发送。归属数据仅供参考。
+
+![Route trace](docs/screenshot-trace.png)
+
+（截图已脱敏：除终点外的 IP 只保留前两段。）
 
 ### 下载和运行
 
@@ -62,6 +79,7 @@
 
 ### 更新记录
 
+- **1.1.0**：新增「路由追踪」模式（逐跳丢包、延迟、归属地、回应条）。
 - **1.0.1**：TCP 连不上或被拒绝时提示可能原因（端口没开放 / NAT 要填映射端口）；图表纵轴刻度格式统一；标题显示版本号。
 - **1.0.0**：首个版本。
 
@@ -79,7 +97,7 @@ build.cmd
 
 | 文件 | 内容 |
 |---|---|
-| `src/IpQuality.cs` | 全部源码（WPF 界面、ICMP / TCP 测试、DNS 解析、图表） |
+| `src/IpQuality.cs` | 全部源码（WPF 界面、ICMP / TCP 测试、路由追踪、DNS 解析、图表） |
 | `src/app.manifest` | 高 DPI 与权限声明（普通用户权限即可，不需要管理员） |
 | `src/app.ico`、`src/make-icon.ps1` | 图标及生成脚本 |
 | `build.cmd` | 编译脚本 |
@@ -88,9 +106,9 @@ build.cmd
 
 ## English
 
-A small portable Windows tool that measures **network quality from this PC to an IP**: latency, packet loss and jitter.
+A small portable Windows tool that measures **network quality from this PC to an IP**: latency, packet loss and jitter, plus a **hop-by-hop route trace** (loss and latency at every hop).
 
-- **Portable single file**: one ~90 KB exe. No installer, just double-click.
+- **Portable single file**: one ~110 KB exe. No installer, just double-click.
 - **Leaves nothing behind**: no registry writes, no config files, no background process. Closing the window ends the process.
 - **Bypasses proxy clients**: when v2rayN, Clash and similar tools run in TUN mode, a normal ping is intercepted and the numbers are fake. This tool can send probes straight out of the physical adapter (Wi‑Fi / Ethernet), so you see the real network.
 
@@ -98,7 +116,7 @@ A small portable Windows tool that measures **network quality from this PC to an
 
 | Item | Details |
 |---|---|
-| Probe type | **ICMP ping**, or **TCP connect** (handshake time to a port; useful when ICMP is blocked) |
+| Probe type | **ICMP ping**; **TCP connect** (handshake time to a port; useful when ICMP is blocked); **route trace** (per-hop statistics, see below) |
 | Target | IPv4 address or domain name; pasting `IP:port` switches to TCP automatically |
 | Options | Count (0 = run until stopped), interval, timeout, ping payload size |
 | Outgoing adapter | Physical adapter selected by default; pick "system routing" to compare |
@@ -109,6 +127,23 @@ A small portable Windows tool that measures **network quality from this PC to an
 Shortcuts: Enter to start, Esc to stop.
 
 The interface is in Chinese.
+
+### Route trace (new in 1.1.0)
+
+Like mtr / itdog: every round probes hops 1–30 at the same time and keeps per-hop statistics.
+
+- For each hop: IP, location (region · AS · carrier), loss, probes sent, last / best / worst / average latency;
+- A "last N rounds" strip: green line = answered, red bar = no answer in that round, so you can see when loss happens. Wider windows show more rounds (up to 300);
+- Once the target is reached, only hops up to the target are probed. The highlighted row is the target, and the summary cards above count the target only;
+- Hops that never answer are shown in grey ("does not answer ping") and are not counted as loss;
+- Loss at a middle hop while later hops and the target show none means that router rate-limits ICMP replies; it is not real loss. **Read the target row** (in the screenshot, hop 5 shows 80% while the target shows 0%);
+- Sticky header, follows the target row automatically, scrolls sideways in narrow windows; "Copy results" includes the full hop table.
+
+Locations are looked up by sending each hop's IP (the IP only) to [ip-api.com](https://ip-api.com). Private and carrier-grade NAT addresses are labelled locally and never sent. Location data is approximate.
+
+![Route trace](docs/screenshot-trace.png)
+
+(The screenshot is anonymised: every IP except the target keeps only its first two octets.)
 
 ### Download and run
 
@@ -142,6 +177,7 @@ Measured with v2rayN in TUN mode:
 
 ### Changelog
 
+- **1.1.0**: New "route trace" mode (per-hop loss, latency, location and answer strip).
 - **1.0.1**: Hint with likely causes when a TCP probe times out or is refused (port closed / NAT needs the mapped port); consistent chart axis labels; version shown in the title bar.
 - **1.0.0**: First release.
 
@@ -159,7 +195,7 @@ build.cmd
 
 | File | Contents |
 |---|---|
-| `src/IpQuality.cs` | All source code (WPF UI, ICMP / TCP probes, DNS, chart) |
+| `src/IpQuality.cs` | All source code (WPF UI, ICMP / TCP probes, route trace, DNS, chart) |
 | `src/app.manifest` | High-DPI and privilege settings (runs as a normal user, no admin needed) |
 | `src/app.ico`, `src/make-icon.ps1` | Icon and the script that draws it |
 | `build.cmd` | Build script |

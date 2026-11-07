@@ -106,7 +106,7 @@ namespace IpQuality
         public string TargetText;
         public IPAddress Target;
         public Nic Source;          // null = 按系统路由
-        public bool Tcp;
+        public bool Tcp, Trace;
         public int Port, Count, Interval, Timeout, Size;
     }
 
@@ -367,6 +367,343 @@ namespace IpQuality
             if (handle != IntPtr.Zero) { IcmpCloseHandle(handle); handle = IntPtr.Zero; }
             if (req != IntPtr.Zero) { Marshal.FreeHGlobal(req); req = IntPtr.Zero; }
             if (reply != IntPtr.Zero) { Marshal.FreeHGlobal(reply); reply = IntPtr.Zero; }
+        }
+    }
+
+    // ---------- 路由追踪：每轮对 TTL 1..N 同时发 ICMP（异步），像 mtr / itdog 一样逐跳统计 ----------
+    class Hop
+    {
+        public int Ttl, Sent, Recv, LocTries;
+        public IPAddress Ip;
+        public string Loc;
+        public double Last = -1, Min = double.MaxValue, Max, Sum;
+        public List<bool> Hist = new List<bool>();
+        public double Loss { get { return Sent == 0 ? 0 : (Sent - Recv) * 100.0 / Sent; } }
+    }
+
+    class TraceState
+    {
+        public List<Hop> Hops = new List<Hop>();   // 下标 = TTL - 1
+        public int Dest, MaxSeen;                   // Dest = 终点在第几跳（0 = 还没到达）
+        public bool GeoBusy;
+
+        public Hop Get(int ttl)
+        {
+            while (Hops.Count < ttl) Hops.Add(new Hop { Ttl = Hops.Count + 1 });
+            return Hops[ttl - 1];
+        }
+
+        public int Visible { get { return Dest > 0 ? Dest : Math.Min(Hops.Count, Math.Max(MaxSeen + 1, 1)); } }
+    }
+
+    sealed class TraceIcmp : IDisposable
+    {
+        [DllImport("iphlpapi.dll", SetLastError = true)] static extern IntPtr IcmpCreateFile();
+        [DllImport("iphlpapi.dll", SetLastError = true)] static extern bool IcmpCloseHandle(IntPtr h);
+        [DllImport("iphlpapi.dll", SetLastError = true)] static extern uint IcmpParseReplies(IntPtr reply, uint size);
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        static extern uint IcmpSendEcho2Ex(IntPtr h, IntPtr evt, IntPtr apc, IntPtr apcCtx, uint src, uint dst,
+                                           IntPtr data, ushort size, IntPtr opts, IntPtr reply, uint replySize, uint timeout);
+
+        public const int MaxHops = 30;
+        public struct R { public bool Got; public IPAddress From; public uint Status; public double Ms; }
+
+        readonly IntPtr[] h = new IntPtr[MaxHops + 1], rep = new IntPtr[MaxHops + 1], opt = new IntPtr[MaxHops + 1];
+        readonly ManualResetEvent[] ev = new ManualResetEvent[MaxHops + 1];
+        readonly bool[] busy = new bool[MaxHops + 1];
+        readonly IntPtr req;
+        readonly int size, repSize;
+
+        public TraceIcmp(int size)
+        {
+            this.size = size;
+            var data = new byte[Math.Max(size, 1)];
+            for (int i = 0; i < data.Length; i++) data[i] = (byte)('a' + i % 23);
+            req = Marshal.AllocHGlobal(data.Length);
+            Marshal.Copy(data, 0, req, data.Length);
+            repSize = size + 512;
+            for (int t = 1; t <= MaxHops; t++)
+            {
+                h[t] = IcmpCreateFile();
+                if (h[t] == new IntPtr(-1)) throw new Exception("无法创建 ICMP 句柄");
+                rep[t] = Marshal.AllocHGlobal(repSize);
+                opt[t] = Marshal.AllocHGlobal(16);          // IP_OPTION_INFORMATION：Ttl 在第 0 字节
+                for (int k = 0; k < 16; k++) Marshal.WriteByte(opt[t], k, 0);
+                Marshal.WriteByte(opt[t], 0, (byte)t);
+                ev[t] = new ManualResetEvent(false);
+            }
+        }
+
+        static uint Addr(IPAddress ip) { return ip == null ? 0u : BitConverter.ToUInt32(ip.GetAddressBytes(), 0); }
+
+        public R[] Round(IPAddress dst, Nic nic, int upto, int timeout)
+        {
+            var res = new R[upto + 1];
+            uint src = Addr(nic == null ? null : nic.Ip), d = Addr(dst);
+            for (int t = 1; t <= upto; t++)
+            {
+                for (int k = 0; k < 16; k += 4) Marshal.WriteInt32(rep[t], k, 0);
+                ev[t].Reset();
+                uint n = IcmpSendEcho2Ex(h[t], ev[t].SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, IntPtr.Zero, src, d,
+                                         req, (ushort)size, opt[t], rep[t], (uint)repSize, (uint)timeout);
+                int err = Marshal.GetLastWin32Error();
+                if (n == 0 && err == 997) busy[t] = true;        // ERROR_IO_PENDING：已异步发出
+                else if (n != 0) Parse(t, ref res[t]);
+                else res[t].Status = (uint)err;
+            }
+            var sw = Stopwatch.StartNew();
+            for (int t = 1; t <= upto; t++)
+            {
+                if (!busy[t]) continue;
+                int left = timeout + 500 - (int)sw.ElapsedMilliseconds;
+                if (ev[t].WaitOne(Math.Max(0, left))) { busy[t] = false; Parse(t, ref res[t]); }
+                else res[t].Status = 11010;
+            }
+            return res;
+        }
+
+        void Parse(int t, ref R r)
+        {
+            uint n = IcmpParseReplies(rep[t], (uint)repSize);
+            uint st = n > 0 ? (uint)Marshal.ReadInt32(rep[t], 4) : (uint)Marshal.GetLastWin32Error();
+            uint a = (uint)Marshal.ReadInt32(rep[t], 0);
+            r.Status = st;
+            if (a != 0 && st != 11010)
+            {
+                r.Got = true; r.From = new IPAddress((long)a); r.Ms = (uint)Marshal.ReadInt32(rep[t], 8);
+            }
+        }
+
+        public void Dispose()
+        {
+            for (int t = 1; t <= MaxHops; t++)
+            {
+                if (ev[t] == null) continue;
+                if (busy[t]) ev[t].WaitOne(3000);
+                if (h[t] != IntPtr.Zero) IcmpCloseHandle(h[t]);
+                Marshal.FreeHGlobal(rep[t]); Marshal.FreeHGlobal(opt[t]); ev[t].Close();
+            }
+            Marshal.FreeHGlobal(req);
+        }
+    }
+
+    // 归属地：内网段本地判断；公网 IP 批量查 ip-api.com（中文），只发 IP 本身
+    static class Geo
+    {
+        public static string Local(IPAddress ip)
+        {
+            var b = ip.GetAddressBytes();
+            if (b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] < 32) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254)) return "局域网";
+            if (b[0] == 100 && b[1] >= 64 && b[1] < 128) return "运营商内网";
+            return null;
+        }
+
+        public static Dictionary<string, string> Lookup(List<string> ips)
+        {
+            var res = new Dictionary<string, string>();
+            string body = "[" + string.Join(",", ips.Select(i => "\"" + i + "\"")) + "]";
+            using (var wc = new WebClient())
+            {
+                wc.Encoding = Encoding.UTF8;
+                wc.Headers[HttpRequestHeader.ContentType] = "application/json";
+                string json = wc.UploadString("http://ip-api.com/batch?lang=zh-CN&fields=status,country,regionName,city,isp,as,query", body);
+                foreach (Match m in Regex.Matches(json, @"\{[^{}]*\}"))
+                {
+                    string o = m.Value, q = F(o, "query");
+                    if (q.Length == 0) continue;
+                    if (F(o, "status") != "success") { res[q] = ""; continue; }
+                    string country = F(o, "country");
+                    var parts = new[] { country == "中国" ? "" : country, F(o, "regionName"), F(o, "city") }.Where(x => x.Length > 0).Distinct();
+                    string asn = F(o, "as").Split(' ')[0], isp = Carrier(asn, F(o, "isp"));
+                    res[q] = string.Join("/", parts) + (asn.Length > 0 ? " · " + asn : "") + (isp.Length > 0 ? " " + isp : "");
+                }
+            }
+            return res;
+        }
+
+        // 常见运营商用中文简称，其余保留原名
+        static readonly Dictionary<string, string> Short = new Dictionary<string, string> {
+            { "AS9808", "移动" }, { "AS56040", "移动" }, { "AS56041", "移动" }, { "AS56042", "移动" }, { "AS56046", "移动" }, { "AS56047", "移动" },
+            { "AS24400", "移动" }, { "AS24444", "移动" }, { "AS58453", "移动国际 CMI" }, { "AS58807", "移动国际 CMIN2" },
+            { "AS4837", "联通" }, { "AS4808", "联通" }, { "AS17621", "联通" }, { "AS17622", "联通" }, { "AS9929", "联通 A 网" }, { "AS10099", "联通国际" },
+            { "AS4134", "电信" }, { "AS4812", "电信" }, { "AS4809", "电信 CN2" }, { "AS23764", "电信国际 CTG" },
+            { "AS2914", "NTT" }, { "AS4637", "Telstra" }, { "AS3491", "PCCW" }, { "AS6453", "TATA" }, { "AS1299", "Arelion" },
+            { "AS174", "Cogent" }, { "AS3356", "Lumen" }, { "AS6939", "HE" }, { "AS13335", "Cloudflare" }, { "AS9269", "香港宽频 HKBN" },
+            { "AS4760", "HKT" }, { "AS9304", "HGC" } };
+
+        static string Carrier(string asn, string isp)
+        {
+            string s;
+            if (Short.TryGetValue(asn, out s)) return s;
+            isp = Regex.Replace(isp, @"[,.]?\s+(Co\.?,?\s*Ltd\.?|Limited|Inc\.?|LLC|Corporation|Corp\.?|Pte\.? Ltd\.?|Communications?|Technology|Network)\b.*$", "", RegexOptions.IgnoreCase);
+            return isp.Length > 28 ? isp.Substring(0, 28) + "…" : isp;
+        }
+
+        static string F(string obj, string key)
+        {
+            var m = Regex.Match(obj, "\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            return m.Success ? Regex.Unescape(m.Groups[1].Value) : "";
+        }
+    }
+
+    // 截图脱敏用（只有自测版会打开）：除终点外的 IP 只保留前两段
+    static class IpMask
+    {
+        public static bool Mask;
+        public static string Ip(IPAddress ip)
+        {
+            if (!Mask) return ip.ToString();
+            var b = ip.GetAddressBytes();
+            return b[0] + "." + b[1] + ".x.x";
+        }
+    }
+
+    // 逐跳表：每跳的 IP、归属、丢包、延迟，以及最近 60 轮的回应条（红 = 这一轮没回应）
+    class HopTable : FrameworkElement
+    {
+        const double HeadH = 30, RowH = 28, FootH = 44;
+        public TraceState State;
+        public ScrollViewer Host;          // 表头固定在可视区顶部，需要知道滚动位置
+        readonly Brush ink, ink2, muted, wash, good, warn, crit, surface;
+        readonly Pen grid, baseline, okLine;
+        public const int HistMax = 300;
+        static readonly string[] Heads = { "跳", "IP", "归属（仅供参考）", "丢包", "已发", "最新 (ms)", "最快 (ms)", "最慢 (ms)", "平均 (ms)", "" };
+        // 归属（第 2 列）按内容定宽，回应条（最后一列）拿走剩下的全部宽度
+        static readonly double[] Widths = { 34, 124, 0, 66, 46, 64, 64, 64, 64, 0 };
+
+        public HopTable(Theme t)
+        {
+            ink = Theme.B(t.Ink); ink2 = Theme.B(t.Ink2); muted = Theme.B(t.Muted); wash = Theme.B(t.Wash);
+            good = Theme.B(t.Good); warn = Theme.B(t.Warning); crit = Theme.B(t.Critical); surface = Theme.B(t.Surface);
+            grid = new Pen(Theme.B(t.Grid), 1); grid.Freeze();
+            baseline = new Pen(Theme.B(t.Baseline), 1); baseline.Freeze();
+            okLine = new Pen(Theme.B(t.Good), 2); okLine.Freeze();
+        }
+
+        int Rows()
+        {
+            if (State == null) return 0;
+            lock (State) return State.Visible;
+        }
+
+        const double MinBar = 150;   // 回应条至少这么宽
+
+        double LocNeed()
+        {
+            double need = 160;
+            if (State != null)
+                lock (State)
+                    for (int r = 0; r < State.Visible; r++)
+                    {
+                        var hp = State.Hops[r];
+                        string s = hp.Ip == null ? "不回应 ping（常见，不影响使用）" : (hp.Loc ?? "查询中…");
+                        need = Math.Max(need, Txt(s, 12.5, ink2, false, 0).Width + 24);
+                    }
+            return Math.Min(need, 640);
+        }
+
+        // 宽度 = 表格完整显示所需的最小宽度；ScrollViewer 视口更宽时会把表格拉伸到视口宽
+        protected override Size MeasureOverride(Size a)
+        {
+            return new Size(Widths.Sum() + 4 + LocNeed() + MinBar, HeadH + Math.Max(Rows(), 1) * RowH + FootH);
+        }
+
+        FormattedText Txt(string s, double size, Brush b, bool bold, double maxW)
+        {
+            var tf = new Typeface(new FontFamily("Segoe UI, Microsoft YaHei UI"), FontStyles.Normal, bold ? FontWeights.SemiBold : FontWeights.Normal, FontStretches.Normal);
+            var ft = new FormattedText(s, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, tf, size, b, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+            if (maxW > 4) { ft.MaxTextWidth = maxW; ft.MaxLineCount = 1; ft.Trimming = TextTrimming.CharacterEllipsis; }
+            return ft;
+        }
+
+        static string Ms(double v) { return v < 0 ? "—" : LatencyChart.Ms(v); }
+
+        protected override void OnRender(DrawingContext dc)
+        {
+            double W = ActualWidth;
+            dc.DrawRectangle(Brushes.Transparent, null, new Rect(0, 0, W, ActualHeight));
+            var w = (double[])Widths.Clone();
+            // 归属列总是按内容给足；窗口不够宽时表格比窗口宽，底下出现横向滚动条
+            w[2] = LocNeed();
+            w[9] = Math.Max(MinBar, W - Widths.Sum() - 4 - w[2]);
+            // 回应条每轮约 3 像素：窗口越宽，能看到的轮数越多（最多 300 轮）
+            int slots = (int)Math.Max(30, Math.Min(HistMax, Math.Floor((w[9] - 14) / 3)));
+            var x = new double[w.Length + 1];
+            for (int i = 0; i < w.Length; i++) x[i + 1] = x[i] + w[i];
+            bool[] right = { false, false, false, true, true, true, true, true, true, false };
+
+            if (State == null)
+            {
+                var e = Txt("选「路由追踪」，填 IP 后开始；每一轮同时探测每一跳", 13, muted, false, 0);
+                dc.DrawText(e, new Point((W - e.Width) / 2, HeadH + 16));
+            }
+            else lock (State)
+            {
+                int n = State.Visible;
+                for (int r = 0; r < n; r++)
+                {
+                    var hp = State.Hops[r];
+                    double y = HeadH + r * RowH;
+                    bool dest = State.Dest == hp.Ttl;
+                    if (dest) dc.DrawRectangle(wash, null, new Rect(0, y, W, RowH));
+                    else dc.DrawLine(grid, new Point(0, y + RowH - 0.5), new Point(W, y + RowH - 0.5));
+                    bool any = hp.Recv > 0;
+                    double loss = hp.Loss;
+                    // 一次都没回应的跳是路由器不回 ping，不算丢包，灰色显示
+                    Brush lb = !any ? muted : loss == 0 ? ink2 : loss < 5 ? warn : crit;
+                    string[] cells = {
+                        hp.Ttl.ToString(), hp.Ip == null ? "*" : dest ? hp.Ip.ToString() : IpMask.Ip(hp.Ip),
+                        hp.Ip == null ? "不回应 ping（常见，不影响使用）" : (hp.Loc ?? "查询中…"),
+                        !any ? "—" : loss.ToString(loss == 0 || loss == 100 ? "0" : "0.0") + "%", hp.Sent.ToString(),
+                        any ? Ms(hp.Last) : "—", any ? Ms(hp.Min) : "—", any ? Ms(hp.Max) : "—", any ? Ms(hp.Sum / hp.Recv) : "—" };
+                    for (int i = 0; i < cells.Length; i++)
+                    {
+                        var b = i == 3 ? lb : i == 2 ? ink2 : (i == 1 && hp.Ip == null) ? muted : ink;
+                        var t = Txt(cells[i], 12.5, b, i == 3 || (dest && i == 1), w[i] - 10);
+                        double tx = right[i] ? x[i + 1] - 8 - t.Width : x[i];
+                        dc.DrawText(t, new Point(tx, y + (RowH - t.Height) / 2));
+                    }
+                    // 回应条：从左往右按时间排，最新的在最右端；绿色底线 = 有回应，红色竖条 = 那一轮没回应
+                    double bx0 = x[9] + 14, bw = w[9] - 14, slot = bw / slots, top = y + 6, bot = y + RowH - 7;
+                    int cnt = Math.Min(hp.Hist.Count, slots), off = hp.Hist.Count - cnt;
+                    if (cnt > 0) dc.DrawLine(any ? okLine : grid, new Point(bx0, bot), new Point(bx0 + cnt * slot, bot));
+                    for (int k = 0; k < cnt && any; k++)
+                        if (!hp.Hist[off + k]) dc.DrawRectangle(crit, null, new Rect(bx0 + k * slot, top, Math.Max(1.5, slot * 0.7), bot - top + 1));
+                }
+                double fy = HeadH + Math.Max(n, 1) * RowH + 8;
+                string note = State.Dest > 0 ? "底色那一行是终点（第 " + State.Dest + " 跳）。" : "还没到达终点；终点若禁 ping，会一直显示到最后有回应的那一跳。";
+                dc.DrawText(Txt(note + "中间某跳丢包、但后面各跳和终点不丢 = 那台路由器限速回复，不是真丢包，以终点一行为准。", 12, muted, false, W - 4), new Point(0, fy));
+                dc.DrawText(Txt("归属地由 ip-api.com 查询（只发送各跳 IP），仅供参考。", 12, muted, false, W - 4), new Point(0, fy + 18));
+            }
+
+            // 表头最后画，固定在可视区顶部，滚动时不跟着走
+            double hy = Host == null ? 0 : Host.VerticalOffset;
+            dc.DrawRectangle(surface, null, new Rect(0, hy, W, HeadH));
+            for (int i = 0; i < Heads.Length; i++)
+            {
+                var t = Txt(i == 9 ? "最近 " + slots + " 轮" + (w[9] > 260 ? "（红 = 没回应）" : "") : Heads[i], 12, muted, false, w[i] - 8);
+                double tx = right[i] ? x[i + 1] - 8 - t.Width : x[i] + (i == 9 ? 14 : 0);
+                dc.DrawText(t, new Point(tx, hy + (HeadH - t.Height) / 2));
+            }
+            dc.DrawLine(baseline, new Point(0, hy + HeadH - 0.5), new Point(W, hy + HeadH - 0.5));
+        }
+
+        public string Text()
+        {
+            if (State == null) return "";
+            var sb = new StringBuilder("跳  IP               丢包     已发   最新    最快    最慢    平均   归属");
+            lock (State)
+                for (int r = 0; r < State.Visible; r++)
+                {
+                    var hp = State.Hops[r];
+                    bool any = hp.Recv > 0;
+                    sb.Append("\r\n").Append(hp.Ttl.ToString().PadRight(4)).Append((hp.Ip == null ? "*" : State.Dest == hp.Ttl ? hp.Ip.ToString() : IpMask.Ip(hp.Ip)).PadRight(17))
+                      .Append((any ? hp.Loss.ToString("0.#") + "%" : "—").PadLeft(6)).Append(hp.Sent.ToString().PadLeft(7))
+                      .Append((any ? Ms(hp.Last) : "—").PadLeft(8)).Append((any ? Ms(hp.Min) : "—").PadLeft(8))
+                      .Append((any ? Ms(hp.Max) : "—").PadLeft(8)).Append((any ? Ms(hp.Sum / hp.Recv) : "—").PadLeft(8))
+                      .Append("   ").Append(hp.Loc ?? "").Append(State.Dest == hp.Ttl ? "  ← 终点" : "");
+                }
+            return sb.ToString();
         }
     }
 
@@ -645,13 +982,23 @@ namespace IpQuality
       </ControlTemplate>
      </Setter.Value></Setter>
     </Trigger>
+    <Trigger Property='Orientation' Value='Horizontal'>
+     <Setter Property='Height' Value='8'/><Setter Property='MinHeight' Value='8'/>
+     <Setter Property='Template'><Setter.Value>
+      <ControlTemplate TargetType='ScrollBar'>
+       <Track x:Name='PART_Track'>
+        <Track.Thumb><Thumb><Thumb.Template><ControlTemplate TargetType='Thumb'><Border Background='$SCROLL$' CornerRadius='4'/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+       </Track>
+      </ControlTemplate>
+     </Setter.Value></Setter>
+    </Trigger>
    </Style.Triggers>
   </Style>
  </Grid.Resources>
 
  <Grid Margin='18'>
   <Grid.RowDefinitions>
-   <RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*' MinHeight='170'/><RowDefinition Height='170'/>
+   <RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*' MinHeight='170'/><RowDefinition x:Name='RLog' Height='170'/>
   </Grid.RowDefinitions>
 
   <Border Style='{StaticResource Card}'>
@@ -668,7 +1015,8 @@ namespace IpQuality
       <TextBlock Style='{StaticResource Cap}' Text='测试方式'/>
       <StackPanel Orientation='Horizontal'>
        <RadioButton x:Name='RIcmp' GroupName='mode' Style='{StaticResource Pill}' Content='ICMP Ping' IsChecked='True' Margin='0,0,6,0'/>
-       <RadioButton x:Name='RTcp' GroupName='mode' Style='{StaticResource Pill}' Content='TCP 连接' Margin='0'/>
+       <RadioButton x:Name='RTcp' GroupName='mode' Style='{StaticResource Pill}' Content='TCP 连接' Margin='0,0,6,0'/>
+       <RadioButton x:Name='RTrace' GroupName='mode' Style='{StaticResource Pill}' Content='路由追踪' Margin='0'/>
       </StackPanel>
      </StackPanel>
      <StackPanel Grid.Column='2' Margin='0,0,14,0'>
@@ -725,11 +1073,11 @@ namespace IpQuality
    <Grid>
     <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/></Grid.RowDefinitions>
     <DockPanel>
-     <StackPanel DockPanel.Dock='Right' Orientation='Horizontal' VerticalAlignment='Center'>
+     <StackPanel x:Name='PLegend' DockPanel.Dock='Right' Orientation='Horizontal' VerticalAlignment='Center'>
       <Rectangle Width='6' Height='12' Fill='$LOSSBAND$' Margin='0,0,6,0'/>
       <TextBlock Text='丢包 / 超时' Foreground='$MUTED$' FontSize='12'/>
      </StackPanel>
-     <TextBlock Text='延迟走势（ms）' FontWeight='SemiBold'/>
+     <TextBlock x:Name='TChartTitle' Text='延迟走势（ms）' FontWeight='SemiBold'/>
     </DockPanel>
     <ContentControl x:Name='ChartHost' Grid.Row='1' Margin='0,8,0,0' Focusable='False'/>
    </Grid>
@@ -753,17 +1101,22 @@ namespace IpQuality
         readonly Theme th;
         readonly FrameworkElement root;
         readonly TextBox tTarget, tPort, tCount, tInterval, tTimeout, tSize, tLog;
-        readonly RadioButton rIcmp, rTcp;
+        readonly RadioButton rIcmp, rTcp, rTrace;
         readonly Button bStart, bCopy;
         readonly WrapPanel wNics;
-        readonly TextBlock tNicHint, vAvg, vLoss, vMin, vMax, vJit, vCount, tStatus;
+        readonly TextBlock tNicHint, vAvg, vLoss, vMin, vMax, vJit, vCount, tStatus, tChartTitle;
         readonly Ellipse lossDot, statusDot;
         readonly LatencyChart chart;
+        readonly HopTable hopTable;
+        readonly ScrollViewer hopScroll;
+        readonly ContentControl chartHost;
+        readonly FrameworkElement pLegend;
+        readonly RowDefinition rLog;
         readonly List<RadioButton> nicButtons = new List<RadioButton>();
         List<Nic> nics = new List<Nic>();
 
         ManualResetEvent stopEvt;
-        bool running;
+        bool running, followEnd = true;
         Settings cur;
         string pathText = "", portHint;
         int sent, recv, jitN;
@@ -774,7 +1127,10 @@ namespace IpQuality
         public MainWindow()
         {
             th = Theme.Detect();
-            Title = "IP 质量测试 1.0.1";
+#if SHOT
+            IpMask.Mask = Environment.GetCommandLineArgs().Contains("mask");
+#endif
+            Title = "IP 质量测试 1.1.0";
             Width = 960; Height = 860; MinWidth = 800; MinHeight = 720;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             UseLayoutRounding = true;
@@ -791,19 +1147,33 @@ namespace IpQuality
 
             tTarget = F<TextBox>("TTarget"); tPort = F<TextBox>("TPort"); tCount = F<TextBox>("TCount");
             tInterval = F<TextBox>("TInterval"); tTimeout = F<TextBox>("TTimeout"); tSize = F<TextBox>("TSize"); tLog = F<TextBox>("TLog");
-            rIcmp = F<RadioButton>("RIcmp"); rTcp = F<RadioButton>("RTcp");
+            rIcmp = F<RadioButton>("RIcmp"); rTcp = F<RadioButton>("RTcp"); rTrace = F<RadioButton>("RTrace");
+            tChartTitle = F<TextBlock>("TChartTitle"); pLegend = F<FrameworkElement>("PLegend"); rLog = F<RowDefinition>("RLog");
             bStart = F<Button>("BStart"); bCopy = F<Button>("BCopy");
             wNics = F<WrapPanel>("WNics"); tNicHint = F<TextBlock>("TNicHint");
             vAvg = F<TextBlock>("VAvg"); vLoss = F<TextBlock>("VLoss"); vMin = F<TextBlock>("VMin");
             vMax = F<TextBlock>("VMax"); vJit = F<TextBlock>("VJit"); vCount = F<TextBlock>("VCount");
             tStatus = F<TextBlock>("TStatus"); lossDot = F<Ellipse>("LossDot"); statusDot = F<Ellipse>("StatusDot");
             chart = new LatencyChart(th);
-            F<ContentControl>("ChartHost").Content = chart;
+            hopTable = new HopTable(th);
+            hopScroll = new ScrollViewer { Content = hopTable, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                                           HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, Focusable = false };
+            hopTable.Host = hopScroll;
+            // 用户往上翻就不再自动跟随；翻回底部恢复跟随
+            hopScroll.ScrollChanged += (o, e) =>
+            {
+                if (e.ExtentHeightChange == 0 && e.ViewportHeightChange == 0 && e.VerticalChange != 0)
+                    followEnd = hopScroll.VerticalOffset >= hopScroll.ScrollableHeight - 2;
+                if (e.VerticalChange != 0) hopTable.InvalidateVisual();
+            };
+            chartHost = F<ContentControl>("ChartHost");
+            chartHost.Content = chart;
 
             bStart.Click += delegate { if (running) Stop(); else Start(); };
             bCopy.Click += delegate { Copy(); };
             rIcmp.Checked += delegate { ModeChanged(); };
             rTcp.Checked += delegate { ModeChanged(); };
+            rTrace.Checked += delegate { ModeChanged(); };
             PreviewKeyDown += OnKey;
             SourceInitialized += delegate
             {
@@ -812,6 +1182,32 @@ namespace IpQuality
                 try { DwmSetWindowAttribute(new WindowInteropHelper(this).Handle, 20, ref on, 4); } catch { }
             };
             Loaded += delegate { tTarget.Focus(); };
+#if SHOT
+            // 仅测试版：IPQuality.exe 截图.png 目标 秒数 [icmp] —— 自动开始、到时截图并把日志写到 .txt，然后退出
+            Loaded += delegate
+            {
+                var a = Environment.GetCommandLineArgs();
+                if (a.Length < 4) return;
+                tTarget.Text = a[2]; tCount.Text = "0";
+                if (a.Length >= 5 && a[4] == "icmp") rIcmp.IsChecked = true; else rTrace.IsChecked = true;
+                if (a.Length >= 6) Width = int.Parse(a[5]);
+                Start();
+                var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(int.Parse(a[3])) };
+                timer.Tick += delegate
+                {
+                    timer.Stop();
+                    var c = (FrameworkElement)Content;
+                    var bmp = new System.Windows.Media.Imaging.RenderTargetBitmap((int)c.ActualWidth, (int)c.ActualHeight, 96, 96, PixelFormats.Pbgra32);
+                    bmp.Render(c);
+                    var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                    enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                    using (var f = System.IO.File.Create(a[1])) enc.Save(f);
+                    System.IO.File.WriteAllText(a[1] + ".txt", tLog.Text + "\r\n" + hopTable.Text(), Encoding.UTF8);
+                    Close();
+                };
+                timer.Start();
+            };
+#endif
 
             LoadNicButtons();
             ModeChanged();
@@ -824,7 +1220,7 @@ namespace IpQuality
             var pill = (Style)root.FindResource("Pill");
             foreach (var n in nics)
             {
-                string text = n.Name + " · " + n.Ip + (n.Virtual ? "（虚拟网卡）" : "");
+                string text = n.Name + " · " + IpMask.Ip(n.Ip) + (n.Virtual ? "（虚拟网卡）" : "");
                 var rb = new RadioButton { Style = pill, GroupName = "nic", Content = text, Tag = n, ToolTip = n.Desc };
                 rb.Checked += delegate { NicChanged(); };
                 wNics.Children.Add(rb); nicButtons.Add(rb);
@@ -856,9 +1252,15 @@ namespace IpQuality
 
         void ModeChanged()
         {
-            bool tcp = rTcp.IsChecked == true;
+            bool tcp = rTcp.IsChecked == true, trace = rTrace.IsChecked == true;
             tPort.IsEnabled = tcp && !running;
             tSize.IsEnabled = !tcp && !running;
+            if (chartHost == null) return;
+            chartHost.Content = trace ? (object)hopScroll : chart;
+            tChartTitle.Text = trace ? "逐跳路由（每一跳的丢包与延迟）" : "延迟走势（ms）";
+            pLegend.Visibility = trace ? Visibility.Collapsed : Visibility.Visible;
+            rLog.Height = new GridLength(trace ? 96 : 170);
+            if (trace && IsLoaded && Height < 1040) Height = Math.Min(1040, SystemParameters.WorkArea.Height);
         }
 
         void OnKey(object sender, KeyEventArgs e)
@@ -889,15 +1291,20 @@ namespace IpQuality
 
             // 支持直接粘贴 “IP:端口”，自动切到 TCP
             var m = Regex.Match(target, @"^([^:\s]+):(\d{1,5})$");
-            if (m.Success) { target = m.Groups[1].Value; tPort.Text = m.Groups[2].Value; rTcp.IsChecked = true; tTarget.Text = target; }
+            if (m.Success)
+            {
+                target = m.Groups[1].Value; tTarget.Text = target;
+                if (rTrace.IsChecked != true) { tPort.Text = m.Groups[2].Value; rTcp.IsChecked = true; }
+            }
             if (target.Contains(":")) { SetStatus("只支持 IPv4", th.Critical); return; }
 
             s.TargetText = target;
             s.Tcp = rTcp.IsChecked == true;
+            s.Trace = rTrace.IsChecked == true;
             s.Source = SelectedNic();
             int v;
             if (!ReadInt(tCount, "次数", 0, 1000000, out v)) return; s.Count = v;
-            if (!ReadInt(tInterval, "间隔", 100, 600000, out v)) return; s.Interval = v;
+            if (!ReadInt(tInterval, "间隔", s.Trace ? 500 : 100, 600000, out v)) return; s.Interval = v;
             if (!ReadInt(tTimeout, "超时", 100, 60000, out v)) return; s.Timeout = v;
             if (s.Tcp) { if (!ReadInt(tPort, "端口", 1, 65535, out v)) return; s.Port = v; }
             else { if (!ReadInt(tSize, "包大小", 0, 65500, out v)) return; s.Size = v; }
@@ -906,6 +1313,8 @@ namespace IpQuality
             portHint = null;
             sent = recv = jitN = 0; sum = jitSum = 0; min = double.MaxValue; max = 0; lastOk = -1;
             chart.Data = new List<Probe>(); chart.Planned = s.Count; chart.InvalidateVisual();
+            hopTable.State = null; hopTable.InvalidateMeasure(); hopTable.InvalidateVisual();
+            followEnd = true;
             tLog.Clear();
             UpdateStats();
             SetRunning(true);
@@ -928,7 +1337,7 @@ namespace IpQuality
             running = on;
             bStart.Content = on ? "停止" : "开始测试";
             bStart.Background = Theme.B(on ? th.Critical : th.Accent);
-            foreach (var c in new UIElement[] { tTarget, tCount, tInterval, tTimeout, rIcmp, rTcp }) c.IsEnabled = !on;
+            foreach (var c in new UIElement[] { tTarget, tCount, tInterval, tTimeout, rIcmp, rTcp, rTrace }) c.IsEnabled = !on;
             foreach (var b in nicButtons) b.IsEnabled = !on;
             ModeChanged();
         }
@@ -951,9 +1360,9 @@ namespace IpQuality
 
                 var b = ip.GetAddressBytes();
                 bool fake = b[0] == 198 && (b[1] == 18 || b[1] == 19);
-                string from = s.Source == null ? "本机（系统路由）" : "本机 " + s.Source.Ip + "（" + s.Source.Name + "）";
+                string from = s.Source == null ? "本机（系统路由）" : "本机 " + IpMask.Ip(s.Source.Ip) + "（" + s.Source.Name + "）";
                 string to = via == null ? ip.ToString() : s.TargetText + "（" + ip + "，经 " + via + " 解析）";
-                string mode = s.Tcp ? "TCP " + s.Port : "ICMP " + s.Size + " 字节";
+                string mode = s.Trace ? "路由追踪（ICMP " + s.Size + " 字节）" : s.Tcp ? "TCP " + s.Port : "ICMP " + s.Size + " 字节";
                 string route = s.Source == null ? "可能经过 v2rayN" : s.Source.Virtual ? "走虚拟网卡" : "绕过 v2rayN";
                 string path = from + " → " + to + " · " + mode + " · " + route;
                 Ui(() =>
@@ -963,6 +1372,7 @@ namespace IpQuality
                     Log("开始 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + path);
                 });
 
+                if (s.Trace) { TraceLoop(s, stop, ip); return; }
                 if (!s.Tcp) icmp = new Icmp(s.Size);
                 var clock = Stopwatch.StartNew();
                 for (int i = 1; s.Count == 0 || i <= s.Count; i++)
@@ -988,6 +1398,86 @@ namespace IpQuality
             {
                 if (icmp != null) icmp.Dispose();
             }
+        }
+
+        void TraceLoop(Settings s, ManualResetEvent stop, IPAddress ip)
+        {
+            var st = new TraceState();
+            Ui(() => { hopTable.State = st; hopTable.InvalidateMeasure(); hopTable.InvalidateVisual(); });
+            bool warned = false;
+            using (var tr = new TraceIcmp(s.Size))
+            {
+                var clock = Stopwatch.StartNew();
+                for (int i = 1; s.Count == 0 || i <= s.Count; i++)
+                {
+                    if (stop.WaitOne(0)) break;
+                    double t0 = clock.Elapsed.TotalMilliseconds;
+                    int upto = st.Dest > 0 ? st.Dest : TraceIcmp.MaxHops;
+                    var res = tr.Round(ip, s.Source, upto, s.Timeout);
+                    var target = new Probe { Seq = i, Note = "终点没有回应" };
+                    var ask = new List<Hop>();
+                    lock (st)
+                    {
+                        for (int t = 1; t <= upto; t++)
+                        {
+                            var hp = st.Get(t);
+                            var r = res[t];
+                            hp.Sent++;
+                            hp.Hist.Add(r.Got);
+                            if (hp.Hist.Count > HopTable.HistMax) hp.Hist.RemoveAt(0);
+                            if (!r.Got) continue;
+                            hp.Recv++; hp.Last = r.Ms; hp.Sum += r.Ms; hp.Min = Math.Min(hp.Min, r.Ms); hp.Max = Math.Max(hp.Max, r.Ms);
+                            if (hp.Ip == null || !hp.Ip.Equals(r.From)) { hp.Ip = r.From; hp.Loc = Geo.Local(r.From); hp.LocTries = 0; }
+                            st.MaxSeen = Math.Max(st.MaxSeen, t);
+                            if (r.Status == 0 && r.From.Equals(ip) && (st.Dest == 0 || t < st.Dest)) st.Dest = t;
+                        }
+                        if (st.Dest > 0)
+                        {
+                            if (st.Hops.Count > st.Dest) st.Hops.RemoveRange(st.Dest, st.Hops.Count - st.Dest);
+                            // 这一轮只要目标在任一 TTL 上回了 echo，就算终点收到（取最小的那一跳）
+                            for (int t = st.Dest; t <= upto; t++)
+                                if (res[t].Got && res[t].Status == 0 && res[t].From.Equals(ip))
+                                { target.Ok = true; target.Ms = res[t].Ms; target.Note = "第 " + st.Dest + " 跳到达"; break; }
+                        }
+                        if (!st.GeoBusy)
+                            ask = st.Hops.Where(h => h.Ip != null && h.Loc == null && h.LocTries < 3).ToList();
+                        if (ask.Count > 0) st.GeoBusy = true;
+                    }
+                    if (ask.Count > 0)
+                        ThreadPool.QueueUserWorkItem(delegate
+                        {
+                            Dictionary<string, string> got = null;
+                            try { got = Geo.Lookup(ask.Select(h => h.Ip.ToString()).Distinct().ToList()); } catch { }
+                            lock (st)
+                            {
+                                foreach (var h in ask)
+                                {
+                                    h.LocTries++;
+                                    string v;
+                                    if (got != null && got.TryGetValue(h.Ip.ToString(), out v)) h.Loc = v;
+                                    else if (h.LocTries >= 3) h.Loc = "";
+                                }
+                                st.GeoBusy = false;
+                            }
+                            Ui(() => { hopTable.InvalidateMeasure(); hopTable.InvalidateVisual(); });
+                        });
+                    bool warn = !warned && i >= 3 && st.Dest == 0;
+                    if (warn) warned = true;
+                    Ui(() =>
+                    {
+                        Add(target);
+                        // 默认跟随到底，保证终点那一行看得见；用户往上翻了就不打扰
+                        hopTable.InvalidateMeasure(); hopTable.InvalidateVisual();
+                        if (followEnd) Dispatcher.BeginInvoke(new Action(() => hopScroll.ScrollToEnd()), System.Windows.Threading.DispatcherPriority.Background);
+                        if (warn) SetStatus("还没到达终点：目标可能禁 ping，表里只看得到中间各跳", th.Warning);
+                    });
+                    if (s.Count != 0 && i == s.Count) break;
+                    double wait = s.Interval - (clock.Elapsed.TotalMilliseconds - t0);
+                    if (wait > 0 && stop.WaitOne((int)wait)) break;
+                }
+            }
+            bool stopped = stop.WaitOne(0);
+            Ui(() => Finish(stopped ? "已停止" : "完成", null));
         }
 
         void Add(Probe r)
@@ -1059,7 +1549,8 @@ namespace IpQuality
                 Log("出错：" + error);
                 return;
             }
-            if (sent > 0) Log(Summary());
+            if (cur != null && cur.Trace && hopTable.State != null) Log("逐跳结果：\r\n" + hopTable.Text());
+            if (sent > 0) Log((cur != null && cur.Trace ? "终点" : "") + Summary());
             double loss = sent == 0 ? 0 : (sent - recv) * 100.0 / sent;
             if (portHint != null && recv == 0) SetStatus(word + " · " + portHint, th.Critical);
             else SetStatus(word + " · " + pathText, sent > 0 && recv == 0 ? th.Critical : loss > 0 ? th.Warning : th.Good);
@@ -1069,6 +1560,7 @@ namespace IpQuality
         {
             string text = tLog.Text;
             if (text.Length == 0) { SetStatus("还没有结果可复制", th.Muted); return; }
+            if (running && cur != null && cur.Trace && hopTable.State != null) text += "\r\n逐跳结果：\r\n" + hopTable.Text();
             if (running && sent > 0) text += "\r\n" + Summary();
             try { Clipboard.SetText(text); SetStatus("结果已复制到剪贴板", th.Good); }
             catch { SetStatus("剪贴板被占用，稍后再试", th.Warning); }
